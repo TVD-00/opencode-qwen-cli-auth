@@ -1,0 +1,67 @@
+{
+  "name": "opencode-alibaba-qwen-cli-auth",
+  "version": "1.0.0",
+  "description": "Alibaba Qwen OAuth authentication plugin for opencode - use your Qwen account instead of API keys",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "license": "MIT",
+  "author": "Geoff Hammond",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TVD-00/opencode-qwen-cli-auth.git"
+  },
+  "keywords": [
+    "opencode",
+    "qwen",
+    "alibaba",
+    "dashscope",
+    "oauth",
+    "qwen-cli",
+    "qwen-coder",
+    "plugin",
+    "auth"
+  ],
+  "homepage": "https://github.com/TVD-00/opencode-qwen-cli-auth#readme",
+  "bugs": {
+    "url": "https://github.com/TVD-00/opencode-qwen-cli-auth/issues"
+  },
+  "scripts": {
+    "build": "tsc && node scripts/copy-fallback.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint . --ext .ts",
+    "lint:fix": "eslint . --ext .ts --fix",
+    "format": "prettier --write \"**/*.{ts,json,md}\"",
+    "format:check": "prettier --check \"**/*.{ts,json,md}\""
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^0.13.7"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^0.13.7",
+    "@opencode-ai/sdk": "^0.13.9",
+    "@types/node": "^24.6.2",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "@vitest/ui": "^3.2.4",
+    "eslint": "^9.0.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "dependencies": {
+    "@openauthjs/openauth": "^0.4.3"
+  }
+}
