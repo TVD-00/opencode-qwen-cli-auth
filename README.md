@@ -1,4 +1,4 @@
-# opencode-alibaba-qwen-cli-auth
+# opencode-qwen-cli-auth
 OAuth plugin for OpenCode that lets you use Qwen models with your Qwen account, without managing a DashScope API key directly.
 
 ## Scope
@@ -30,7 +30,7 @@ Add the plugin to your OpenCode config:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-alibaba-qwen-cli-auth"],
+  "plugin": ["opencode-qwen-cli-auth"],
   "model": "alibaba/coder-model"
 }
 ```
@@ -153,7 +153,7 @@ npm run lint
 - Terms of Service: https://qwen.ai/termsservice
 - Privacy Policy: https://qwen.ai/privacypolicy
 - Usage Policy: https://qwen.ai/usagepolicy
-- NPM: https://www.npmjs.com/package/opencode-alibaba-qwen-cli-auth
+- NPM: https://www.npmjs.com/package/opencode-qwen-cli-auth
 - Repository: https://github.com/TVD-00/opencode-qwen-cli-auth
 - Issues: https://github.com/TVD-00/opencode-qwen-cli-auth/issues
 
