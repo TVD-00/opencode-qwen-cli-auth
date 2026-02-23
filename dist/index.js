@@ -173,11 +173,12 @@ export const QwenAuthPlugin = async (_input) => {
                     "coder-model": {
                         id: "coder-model",
                         name: "Qwen Coder (Qwen 3.5 Plus)",
-                        reasoning: true,
+                        // Qwen khong ho tro reasoning_effort tu OpenCode UI
+                        // Thinking luon bat mac dinh phia server (qwen3.5-plus)
+                        reasoning: false,
                         limit: { context: 1048576, output: 65536 },
                         cost: { input: 0, output: 0 },
                         modalities: { input: ["text"], output: ["text"] },
-                        options: { extraBody: { enable_thinking: true } },
                     },
                     "vision-model": {
                         id: "vision-model",
