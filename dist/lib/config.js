@@ -8,6 +8,12 @@ export function getConfigDir() {
     return join(homedir(), ".opencode", "qwen");
 }
 /**
+ * Get Qwen CLI credential directory (~/.qwen)
+ */
+export function getQwenDir() {
+    return join(homedir(), ".qwen");
+}
+/**
  * Get plugin configuration file path
  */
 export function getConfigPath() {
@@ -52,6 +58,18 @@ export function getQwenMode(config) {
  * Get token storage path
  */
 export function getTokenPath() {
+    return join(getQwenDir(), "oauth_creds.json");
+}
+/**
+ * Get token lock path for multi-process refresh coordination
+ */
+export function getTokenLockPath() {
+    return join(getQwenDir(), "oauth_creds.lock");
+}
+/**
+ * Get legacy token storage path used by old plugin versions
+ */
+export function getLegacyTokenPath() {
     return join(getConfigDir(), "oauth_token.json");
 }
 /**

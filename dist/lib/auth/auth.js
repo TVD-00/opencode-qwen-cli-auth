@@ -1,27 +1,52 @@
 import { generatePKCE } from "@openauthjs/openauth/pkce";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, renameSync, statSync } from "fs";
 import { QWEN_OAUTH, DEFAULT_QWEN_BASE_URL, TOKEN_REFRESH_BUFFER_MS, VERIFICATION_URI } from "../constants.js";
-import { getTokenPath, getConfigDir } from "../config.js";
+import { getTokenPath, getQwenDir, getTokenLockPath, getLegacyTokenPath } from "../config.js";
 import { logError, logWarn, logInfo, LOGGING_ENABLED } from "../logger.js";
-// Maximum retry attempts when token refresh fails
-const MAX_REFRESH_RETRIES = 2;
+const MAX_REFRESH_RETRIES = 1;
 const REFRESH_RETRY_DELAY_MS = 1000;
-/**
- * Normalize and validate resource_url from OAuth response
- * @param resourceUrl - Resource URL from token response
- * @returns Normalized URL or undefined if invalid
- */
+const OAUTH_REQUEST_TIMEOUT_MS = 15000;
+const LOCK_TIMEOUT_MS = 10000;
+const LOCK_ATTEMPT_INTERVAL_MS = 100;
+const LOCK_BACKOFF_MULTIPLIER = 1.5;
+const LOCK_MAX_INTERVAL_MS = 2000;
+const LOCK_MAX_ATTEMPTS = 20;
+function isAbortError(error) {
+    return typeof error === "object" && error !== null && ("name" in error) && error.name === "AbortError";
+}
+function hasErrorCode(error, code) {
+    return typeof error === "object" && error !== null && ("code" in error) && error.code === code;
+}
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+async function fetchWithTimeout(url, init, timeoutMs = OAUTH_REQUEST_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, {
+            ...init,
+            signal: controller.signal,
+        });
+    }
+    catch (error) {
+        if (isAbortError(error)) {
+            throw new Error(`OAuth request timed out after ${timeoutMs}ms`);
+        }
+        throw error;
+    }
+    finally {
+        clearTimeout(timeoutId);
+    }
+}
 function normalizeResourceUrl(resourceUrl) {
     if (!resourceUrl)
         return undefined;
     try {
-        // Qwen returns resource_url without protocol (e.g., "portal.qwen.ai")
-        // Normalize it by adding https:// if missing
         let normalizedUrl = resourceUrl;
         if (!normalizedUrl.startsWith("http://") && !normalizedUrl.startsWith("https://")) {
             normalizedUrl = `https://${normalizedUrl}`;
         }
-        // Validate the normalized URL
         new URL(normalizedUrl);
         if (LOGGING_ENABLED) {
             logInfo("Valid resource_url found and normalized:", normalizedUrl);
@@ -33,35 +58,168 @@ function normalizeResourceUrl(resourceUrl) {
         return undefined;
     }
 }
-/**
- * Validate token response fields
- * @param json - Token response JSON
- * @param context - Context for logging (e.g., "token response" or "refresh response")
- * @returns True if valid, false otherwise
- */
 function validateTokenResponse(json, context) {
-    // Check required fields
-    if (!json.access_token || !json.refresh_token || typeof json.expires_in !== "number") {
-        logError(`${context} missing fields:`, json);
+    if (!json.access_token || typeof json.access_token !== "string") {
+        logError(`${context} missing access_token`);
         return false;
     }
-    // Validate expires_in is positive
-    if (json.expires_in <= 0) {
-        logError(`invalid expires_in value in ${context}:`, json.expires_in);
+    if (!json.refresh_token || typeof json.refresh_token !== "string") {
+        logError(`${context} missing refresh_token`);
+        return false;
+    }
+    if (typeof json.expires_in !== "number" || json.expires_in <= 0) {
+        logError(`${context} invalid expires_in:`, json.expires_in);
         return false;
     }
     return true;
 }
-/**
- * Request device authorization code
- * @param pkce - PKCE challenge/verifier pair
- * @returns Device authorization response with user code and verification URL
- */
+function toStoredTokenData(data) {
+    if (!data || typeof data !== "object") {
+        return null;
+    }
+    const raw = data;
+    const accessToken = typeof raw.access_token === "string" ? raw.access_token : undefined;
+    const refreshToken = typeof raw.refresh_token === "string" ? raw.refresh_token : undefined;
+    const tokenType = typeof raw.token_type === "string" && raw.token_type.length > 0 ? raw.token_type : "Bearer";
+    const expiryDate = typeof raw.expiry_date === "number"
+        ? raw.expiry_date
+        : typeof raw.expires === "number"
+            ? raw.expires
+            : typeof raw.expiry_date === "string"
+                ? Number(raw.expiry_date)
+                : undefined;
+    const resourceUrl = typeof raw.resource_url === "string" ? raw.resource_url : undefined;
+    if (!accessToken || !refreshToken || typeof expiryDate !== "number" || !Number.isFinite(expiryDate) || expiryDate <= 0) {
+        return null;
+    }
+    return {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        token_type: tokenType,
+        expiry_date: expiryDate,
+        resource_url: resourceUrl,
+    };
+}
+function buildTokenSuccessFromStored(stored) {
+    return {
+        type: "success",
+        access: stored.access_token,
+        refresh: stored.refresh_token,
+        expires: stored.expiry_date,
+        resourceUrl: stored.resource_url,
+    };
+}
+function writeStoredTokenData(tokenData) {
+    const qwenDir = getQwenDir();
+    if (!existsSync(qwenDir)) {
+        mkdirSync(qwenDir, { recursive: true, mode: 0o700 });
+    }
+    const tokenPath = getTokenPath();
+    const tempPath = `${tokenPath}.tmp.${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+    try {
+        writeFileSync(tempPath, JSON.stringify(tokenData, null, 2), {
+            encoding: "utf-8",
+            mode: 0o600,
+        });
+        renameSync(tempPath, tokenPath);
+    }
+    catch (error) {
+        try {
+            if (existsSync(tempPath)) {
+                unlinkSync(tempPath);
+            }
+        }
+        catch (_cleanupError) {
+        }
+        throw error;
+    }
+}
+function migrateLegacyTokenIfNeeded() {
+    const tokenPath = getTokenPath();
+    if (existsSync(tokenPath)) {
+        return;
+    }
+    const legacyPath = getLegacyTokenPath();
+    if (!existsSync(legacyPath)) {
+        return;
+    }
+    try {
+        const legacyRaw = readFileSync(legacyPath, "utf-8");
+        const legacyData = JSON.parse(legacyRaw);
+        const converted = toStoredTokenData(legacyData);
+        if (!converted) {
+            logWarn("Legacy token found but invalid, skipping migration");
+            return;
+        }
+        writeStoredTokenData(converted);
+        logInfo("Migrated token from legacy path to ~/.qwen/oauth_creds.json");
+    }
+    catch (error) {
+        logWarn("Failed to migrate legacy token:", error);
+    }
+}
+async function acquireTokenLock() {
+    const lockPath = getTokenLockPath();
+    const lockValue = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    let waitMs = LOCK_ATTEMPT_INTERVAL_MS;
+    for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt++) {
+        try {
+            writeFileSync(lockPath, lockValue, {
+                encoding: "utf-8",
+                flag: "wx",
+                mode: 0o600,
+            });
+            return lockPath;
+        }
+        catch (error) {
+            if (!hasErrorCode(error, "EEXIST")) {
+                throw error;
+            }
+            try {
+                const stats = statSync(lockPath);
+                const ageMs = Date.now() - stats.mtimeMs;
+                if (ageMs > LOCK_TIMEOUT_MS) {
+                    try {
+                        unlinkSync(lockPath);
+                        logWarn("Removed stale token lock file", { lockPath, ageMs });
+                    }
+                    catch (staleError) {
+                        if (!hasErrorCode(staleError, "ENOENT")) {
+                            logWarn("Failed to remove stale token lock", staleError);
+                        }
+                    }
+                    continue;
+                }
+            }
+            catch (statError) {
+                if (!hasErrorCode(statError, "ENOENT")) {
+                    logWarn("Failed to inspect token lock file", statError);
+                }
+            }
+            await sleep(waitMs);
+            waitMs = Math.min(Math.floor(waitMs * LOCK_BACKOFF_MULTIPLIER), LOCK_MAX_INTERVAL_MS);
+        }
+    }
+    throw new Error("Token refresh lock timeout");
+}
+function releaseTokenLock(lockPath) {
+    try {
+        unlinkSync(lockPath);
+    }
+    catch (error) {
+        if (!hasErrorCode(error, "ENOENT")) {
+            logWarn("Failed to release token lock file", error);
+        }
+    }
+}
 export async function requestDeviceCode(pkce) {
     try {
-        const res = await fetch(QWEN_OAUTH.DEVICE_CODE_URL, {
+        const res = await fetchWithTimeout(QWEN_OAUTH.DEVICE_CODE_URL, {
             method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                Accept: "application/json",
+            },
             body: new URLSearchParams({
                 client_id: QWEN_OAUTH.CLIENT_ID,
                 scope: QWEN_OAUTH.SCOPE,
@@ -82,11 +240,9 @@ export async function requestDeviceCode(pkce) {
             logError("device code response missing fields:", json);
             return null;
         }
-        // Ensure verification_uri_complete includes the client parameter
-        // Qwen's OAuth server requires client=qwen-code for proper authentication
         if (!json.verification_uri_complete || !json.verification_uri_complete.includes(VERIFICATION_URI.CLIENT_PARAM_KEY)) {
             const baseUrl = json.verification_uri_complete || json.verification_uri;
-            const separator = baseUrl.includes('?') ? '&' : '?';
+            const separator = baseUrl.includes("?") ? "&" : "?";
             json.verification_uri_complete = `${baseUrl}${separator}${VERIFICATION_URI.CLIENT_PARAM_VALUE}`;
             if (LOGGING_ENABLED) {
                 logInfo("Fixed verification_uri_complete:", json.verification_uri_complete);
@@ -99,18 +255,14 @@ export async function requestDeviceCode(pkce) {
         return null;
     }
 }
-/**
- * Poll for token using device code
- * @param deviceCode - Device code from authorization response
- * @param verifier - PKCE verifier
- * @param interval - Polling interval in seconds (from device response)
- * @returns Token result or null if still pending
- */
 export async function pollForToken(deviceCode, verifier, interval = 2) {
     try {
-        const res = await fetch(QWEN_OAUTH.TOKEN_URL, {
+        const res = await fetchWithTimeout(QWEN_OAUTH.TOKEN_URL, {
             method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                Accept: "application/json",
+            },
             body: new URLSearchParams({
                 grant_type: QWEN_OAUTH.GRANT_TYPE_DEVICE,
                 client_id: QWEN_OAUTH.CLIENT_ID,
@@ -120,26 +272,35 @@ export async function pollForToken(deviceCode, verifier, interval = 2) {
         });
         if (!res.ok) {
             const json = await res.json().catch(() => ({}));
-            const error = json.error;
-            // Handle expected errors
-            if (error === "authorization_pending") {
+            const errorCode = typeof json.error === "string" ? json.error : undefined;
+            const errorDescription = typeof json.error_description === "string" ? json.error_description : "No details provided";
+            if (errorCode === "authorization_pending") {
                 return { type: "pending" };
             }
-            if (error === "slow_down") {
+            if (errorCode === "slow_down") {
                 return { type: "slow_down" };
             }
-            if (error === "expired_token") {
+            if (errorCode === "expired_token") {
                 return { type: "expired" };
             }
-            if (error === "access_denied") {
+            if (errorCode === "access_denied") {
                 return { type: "denied" };
             }
-            logError("token poll failed:", { status: res.status, json });
-            return { type: "failed" };
+            logError("token poll failed:", {
+                status: res.status,
+                error: errorCode,
+                description: errorDescription,
+            });
+            return {
+                type: "failed",
+                status: res.status,
+                error: errorCode || "unknown_error",
+                description: errorDescription,
+                fatal: true,
+            };
         }
         const json = await res.json();
         if (LOGGING_ENABLED) {
-            // Log the full token response for debugging
             logInfo("Token response received:", {
                 has_access_token: !!json.access_token,
                 has_refresh_token: !!json.refresh_token,
@@ -148,39 +309,46 @@ export async function pollForToken(deviceCode, verifier, interval = 2) {
                 all_fields: Object.keys(json),
             });
         }
-        // Validate token response fields
         if (!validateTokenResponse(json, "token response")) {
-            return { type: "failed" };
+            return {
+                type: "failed",
+                error: "invalid_token_response",
+                description: "Token response missing required fields",
+                fatal: true,
+            };
         }
-        // Validate and normalize resource_url if present
         json.resource_url = normalizeResourceUrl(json.resource_url);
         if (!json.resource_url) {
             logWarn("No valid resource_url in token response, will use default DashScope endpoint");
         }
-        // At this point, validation ensures these fields exist
         return {
             type: "success",
             access: json.access_token,
             refresh: json.refresh_token,
             expires: Date.now() + json.expires_in * 1000,
-            resourceUrl: json.resource_url, // Dynamic API base URL
+            resourceUrl: json.resource_url,
         };
     }
     catch (error) {
-        logError("token poll error:", error);
-        return { type: "failed" };
+        const message = error instanceof Error ? error.message : String(error);
+        const lowered = message.toLowerCase();
+        const transient = lowered.includes("timed out") || lowered.includes("network") || lowered.includes("fetch");
+        logWarn("token poll failed:", { message, transient });
+        return {
+            type: "failed",
+            error: message,
+            fatal: !transient,
+        };
     }
 }
-/**
- * Refresh access token using refresh token (single attempt, no retry)
- * @param refreshToken - Refresh token
- * @returns Token result
- */
 async function refreshAccessTokenOnce(refreshToken) {
     try {
-        const res = await fetch(QWEN_OAUTH.TOKEN_URL, {
+        const res = await fetchWithTimeout(QWEN_OAUTH.TOKEN_URL, {
             method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                Accept: "application/json",
+            },
             body: new URLSearchParams({
                 grant_type: QWEN_OAUTH.GRANT_TYPE_REFRESH,
                 client_id: QWEN_OAUTH.CLIENT_ID,
@@ -189,8 +357,17 @@ async function refreshAccessTokenOnce(refreshToken) {
         });
         if (!res.ok) {
             const text = await res.text().catch(() => "");
+            const lowered = text.toLowerCase();
+            const isUnauthorized = res.status === 401 || res.status === 403;
+            const isRateLimited = res.status === 429;
+            const transient = res.status >= 500 || lowered.includes("timed out") || lowered.includes("network");
             logError("token refresh failed:", { status: res.status, text });
-            return { type: "failed", status: res.status };
+            return {
+                type: "failed",
+                status: res.status,
+                error: text || `HTTP ${res.status}`,
+                fatal: isUnauthorized || isRateLimited || !transient,
+            };
         }
         const json = await res.json();
         if (LOGGING_ENABLED) {
@@ -202,11 +379,14 @@ async function refreshAccessTokenOnce(refreshToken) {
                 all_fields: Object.keys(json),
             });
         }
-        // Validate token response fields
         if (!validateTokenResponse(json, "refresh response")) {
-            return { type: "failed" };
+            return {
+                type: "failed",
+                error: "invalid_refresh_response",
+                description: "Refresh response missing required fields",
+                fatal: true,
+            };
         }
-        // Validate and normalize resource_url if present
         json.resource_url = normalizeResourceUrl(json.resource_url);
         if (!json.resource_url) {
             logWarn("No valid resource_url in refresh response, will use default DashScope endpoint");
@@ -220,199 +400,179 @@ async function refreshAccessTokenOnce(refreshToken) {
         };
     }
     catch (error) {
-        logError("token refresh error:", error);
-        return { type: "failed" };
+        const message = error instanceof Error ? error.message : String(error);
+        const lowered = message.toLowerCase();
+        const transient = lowered.includes("timed out") || lowered.includes("network") || lowered.includes("fetch");
+        logError("token refresh error:", { message, transient });
+        return {
+            type: "failed",
+            error: message,
+            fatal: !transient,
+        };
     }
 }
-/**
- * Refresh access token with retry logic.
- * Retries up to MAX_REFRESH_RETRIES times with delay between attempts.
- * @param refreshToken - Refresh token
- * @returns Token result
- */
 export async function refreshAccessToken(refreshToken) {
-    for (let attempt = 0; attempt <= MAX_REFRESH_RETRIES; attempt++) {
-        const result = await refreshAccessTokenOnce(refreshToken);
-        if (result.type === "success") {
-            return result;
+    const lockPath = await acquireTokenLock();
+    try {
+        const latest = loadStoredToken();
+        if (latest && !isTokenExpired(latest.expiry_date)) {
+            return buildTokenSuccessFromStored(latest);
         }
-        // If 401/403 error, refresh token was revoked, no need to retry
-        if (result.status === 401 || result.status === 403) {
-            logError("Refresh token rejected (" + result.status + "), re-authentication required");
-            return { type: "failed" };
-        }
-        // If retries remaining, wait and try again
-        if (attempt < MAX_REFRESH_RETRIES) {
-            if (LOGGING_ENABLED) {
-                logInfo(`Token refresh failed, retrying attempt ${attempt + 2}/${MAX_REFRESH_RETRIES + 1}...`);
+        const effectiveRefreshToken = latest?.refresh_token || refreshToken;
+        for (let attempt = 0; attempt <= MAX_REFRESH_RETRIES; attempt++) {
+            const result = await refreshAccessTokenOnce(effectiveRefreshToken);
+            if (result.type === "success") {
+                saveToken(result);
+                return result;
             }
-            await new Promise(resolve => setTimeout(resolve, REFRESH_RETRY_DELAY_MS));
+            if (result.status === 401 || result.status === 403) {
+                logError(`Refresh token rejected (${result.status}), re-authentication required`);
+                clearStoredToken();
+                return { type: "failed", status: result.status, error: "refresh_token_rejected", fatal: true };
+            }
+            if (result.status === 429) {
+                logError("Token refresh rate-limited (429), aborting retries");
+                return { type: "failed", status: 429, error: "rate_limited", fatal: true };
+            }
+            if (result.fatal) {
+                logError("Token refresh failed with fatal error", result);
+                return result;
+            }
+            if (attempt < MAX_REFRESH_RETRIES) {
+                if (LOGGING_ENABLED) {
+                    logInfo(`Token refresh transient failure, retrying attempt ${attempt + 2}/${MAX_REFRESH_RETRIES + 1}...`);
+                }
+                await sleep(REFRESH_RETRY_DELAY_MS);
+            }
         }
+        logError("Token refresh failed after retry limit");
+        return { type: "failed", error: "refresh_failed" };
     }
-    logError("Token refresh failed after " + (MAX_REFRESH_RETRIES + 1) + " attempts");
-    return { type: "failed" };
+    finally {
+        releaseTokenLock(lockPath);
+    }
 }
-/**
- * Generate PKCE challenge and verifier
- * @returns PKCE pair
- */
 export async function createPKCE() {
     const { challenge, verifier } = await generatePKCE();
     return { challenge, verifier };
 }
-/**
- * Load stored token from disk
- * @returns Stored token data or null if not found
- */
 export function loadStoredToken() {
+    migrateLegacyTokenIfNeeded();
     const tokenPath = getTokenPath();
     if (!existsSync(tokenPath)) {
         return null;
     }
     try {
         const content = readFileSync(tokenPath, "utf-8");
-        const data = JSON.parse(content);
-        // Validate required fields
-        if (!data.access_token || !data.refresh_token || typeof data.expires !== "number") {
+        const parsed = JSON.parse(content);
+        const normalized = toStoredTokenData(parsed);
+        if (!normalized) {
             logWarn("Invalid token data, re-authentication required");
             return null;
         }
-        return data;
+        const needsRewrite = typeof parsed.expiry_date !== "number" || typeof parsed.token_type !== "string" || typeof parsed.expires === "number";
+        if (needsRewrite) {
+            try {
+                writeStoredTokenData(normalized);
+            }
+            catch (rewriteError) {
+                logWarn("Failed to normalize token file format:", rewriteError);
+            }
+        }
+        return normalized;
     }
     catch (error) {
         logError("Failed to load token:", error);
         return null;
     }
 }
-/**
- * Delete token stored on disk when token is no longer valid.
- */
 export function clearStoredToken() {
-    const tokenPath = getTokenPath();
-    if (existsSync(tokenPath)) {
+    const targets = [getTokenPath(), getLegacyTokenPath()];
+    for (const tokenPath of targets) {
+        if (!existsSync(tokenPath)) {
+            continue;
+        }
         try {
             unlinkSync(tokenPath);
-            logWarn("Deleted old token, re-authentication required");
+            logWarn(`Deleted token file: ${tokenPath}`);
         }
         catch (error) {
-            logError("Unable to delete token file:", error);
+            logError("Unable to delete token file:", { tokenPath, error });
         }
     }
 }
-/**
- * Save token to disk
- * @param tokenResult - Token result from OAuth flow
- */
 export function saveToken(tokenResult) {
     if (tokenResult.type !== "success") {
         throw new Error("Cannot save non-success token result");
     }
-    const configDir = getConfigDir();
-    // Ensure directory exists
-    if (!existsSync(configDir)) {
-        mkdirSync(configDir, { recursive: true, mode: 0o700 });
-    }
     const tokenData = {
         access_token: tokenResult.access,
         refresh_token: tokenResult.refresh,
-        expires: tokenResult.expires,
+        token_type: "Bearer",
+        expiry_date: tokenResult.expires,
         resource_url: tokenResult.resourceUrl,
     };
-    const tokenPath = getTokenPath();
     try {
-        writeFileSync(tokenPath, JSON.stringify(tokenData, null, 2), {
-            encoding: "utf-8",
-            mode: 0o600, // Secure permissions
-        });
+        writeStoredTokenData(tokenData);
     }
     catch (error) {
         logError("Failed to save token:", error);
         throw error;
     }
 }
-/**
- * Check if token is expired (with 5 minute buffer)
- * @param expiresAt - Expiration timestamp in milliseconds
- * @returns True if token is expired or will expire soon
- */
 export function isTokenExpired(expiresAt) {
     return Date.now() >= expiresAt - TOKEN_REFRESH_BUFFER_MS;
 }
-/**
- * Get valid access token, refreshing if necessary.
- * When refresh fails, delete old token so user knows re-authentication is needed.
- * @returns Access token and resource URL, or null if authentication required
- */
 export async function getValidToken() {
     const stored = loadStoredToken();
     if (!stored) {
-        return null; // No token, authentication required
+        return null;
     }
-    // Token is still valid
-    if (!isTokenExpired(stored.expires)) {
+    if (!isTokenExpired(stored.expiry_date)) {
         return {
             accessToken: stored.access_token,
             resourceUrl: stored.resource_url,
         };
     }
-    // Token expired, try refresh (has retry logic inside)
     if (LOGGING_ENABLED) {
         logInfo("Token expired, refreshing...");
     }
     const refreshResult = await refreshAccessToken(stored.refresh_token);
     if (refreshResult.type !== "success") {
         logError("Token refresh failed, re-authentication required");
-        // Delete old token to avoid error loop
         clearStoredToken();
         return null;
     }
-    // Save new token
-    saveToken(refreshResult);
     return {
         accessToken: refreshResult.access,
         resourceUrl: refreshResult.resourceUrl,
     };
 }
-/**
- * Get Portal API base URL from token or use default
- * @param resourceUrl - Resource URL from token (optional)
- * @returns Portal API base URL
- *
- * IMPORTANT: Portal API uses /v1 path (not /api/v1)
- * - OAuth endpoints: /api/v1/oauth2/ (for authentication)
- * - Chat API: /v1/ (for completions)
- */
 export function getApiBaseUrl(resourceUrl) {
     if (resourceUrl) {
-        // Validate URL format
         try {
             const url = new URL(resourceUrl);
-            if (!url.protocol.startsWith('http')) {
-                logWarn('Invalid resource_url protocol, using default Portal API URL');
+            if (!url.protocol.startsWith("http")) {
+                logWarn("Invalid resource_url protocol, using default Portal API URL");
                 return DEFAULT_QWEN_BASE_URL;
             }
-            // Construct the Portal API endpoint from resource_url
-            // Qwen returns "portal.qwen.ai" which should become "https://portal.qwen.ai/v1"
-            // Remove trailing slash if present
             let baseUrl = resourceUrl.replace(/\/$/, "");
-            // Add /v1 suffix if not already present
-            const suffix = '/v1';
+            const suffix = "/v1";
             if (!baseUrl.endsWith(suffix)) {
                 baseUrl = `${baseUrl}${suffix}`;
             }
             if (LOGGING_ENABLED) {
-                logInfo('Constructed Portal API base URL from resource_url:', baseUrl);
+                logInfo("Constructed Portal API base URL from resource_url:", baseUrl);
             }
             return baseUrl;
         }
         catch (error) {
-            logWarn('Invalid resource_url format, using default Portal API URL:', error);
+            logWarn("Invalid resource_url format, using default Portal API URL:", error);
             return DEFAULT_QWEN_BASE_URL;
         }
     }
-    // Fall back to default Portal API URL
     if (LOGGING_ENABLED) {
-        logInfo('No resource_url provided, using default Portal API URL');
+        logInfo("No resource_url provided, using default Portal API URL");
     }
     return DEFAULT_QWEN_BASE_URL;
 }

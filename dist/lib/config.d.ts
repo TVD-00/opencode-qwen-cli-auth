@@ -4,6 +4,10 @@ import type { PluginConfig } from "./types.js";
  */
 export declare function getConfigDir(): string;
 /**
+ * Get Qwen CLI credential directory (~/.qwen)
+ */
+export declare function getQwenDir(): string;
+/**
  * Get plugin configuration file path
  */
 export declare function getConfigPath(): string;
@@ -21,6 +25,14 @@ export declare function getQwenMode(config: PluginConfig): boolean;
  * Get token storage path
  */
 export declare function getTokenPath(): string;
+/**
+ * Get token lock path for multi-process refresh coordination
+ */
+export declare function getTokenLockPath(): string;
+/**
+ * Get legacy token storage path used by old plugin versions
+ */
+export declare function getLegacyTokenPath(): string;
 /**
  * Get cache directory for prompts
  */

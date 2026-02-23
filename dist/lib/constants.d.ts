@@ -45,7 +45,7 @@ export declare const HTTP_STATUS: {
  */
 export declare const PORTAL_HEADERS: {
     readonly AUTH_TYPE: "X-DashScope-AuthType";
-    readonly AUTH_TYPE_VALUE: "qwen_oauth";
+    readonly AUTH_TYPE_VALUE: "qwen-oauth";
 };
 /** Device flow polling configuration */
 export declare const DEVICE_FLOW: {
@@ -85,7 +85,7 @@ export declare const PLATFORM_OPENERS: {
 };
 /** OAuth authorization labels */
 export declare const AUTH_LABELS: {
-    readonly OAUTH: "Qwen Account (OAuth)";
+    readonly OAUTH: "Qwen Code (qwen.ai OAuth)";
     readonly INSTRUCTIONS: "Visit the URL shown in your browser to complete authentication.";
 };
 /** OAuth verification URI parameters */

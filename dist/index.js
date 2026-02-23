@@ -7,9 +7,14 @@
  * @license MIT with Usage Disclaimer (see LICENSE file)
  * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
  */
-import { createPKCE, requestDeviceCode, pollForToken, getApiBaseUrl, saveToken, refreshAccessToken, loadStoredToken } from "./lib/auth/auth.js";
-import { PROVIDER_ID, AUTH_LABELS, DEVICE_FLOW, DEFAULT_QWEN_BASE_URL } from "./lib/constants.js";
-import { logError, logInfo, LOGGING_ENABLED } from "./lib/logger.js";
+import { randomUUID } from "node:crypto";
+import { createPKCE, requestDeviceCode, pollForToken, getApiBaseUrl, saveToken, refreshAccessToken, loadStoredToken, getValidToken } from "./lib/auth/auth.js";
+import { PROVIDER_ID, AUTH_LABELS, DEVICE_FLOW, PORTAL_HEADERS } from "./lib/constants.js";
+import { logError, logInfo, logWarn, LOGGING_ENABLED } from "./lib/logger.js";
+const CHAT_REQUEST_TIMEOUT_MS = 30000;
+const CHAT_MAX_RETRIES = 0;
+const MAX_CONSECUTIVE_POLL_FAILURES = 3;
+const PLUGIN_USER_AGENT = "opencode-qwen-cli-auth/2.2.1";
 /**
  * Get valid access token from SDK auth state, refresh if expired.
  * Uses getAuth() from SDK instead of reading file directly.
@@ -18,6 +23,10 @@ import { logError, logInfo, LOGGING_ENABLED } from "./lib/logger.js";
  * @returns Access token or null
  */
 async function getValidAccessToken(getAuth) {
+    const diskToken = await getValidToken();
+    if (diskToken?.accessToken) {
+        return diskToken.accessToken;
+    }
     const auth = await getAuth();
     if (!auth || auth.type !== "oauth") {
         return null;
@@ -45,6 +54,19 @@ async function getValidAccessToken(getAuth) {
             accessToken = undefined;
         }
     }
+    if (auth.access && auth.refresh) {
+        try {
+            saveToken({
+                type: "success",
+                access: accessToken || auth.access,
+                refresh: auth.refresh,
+                expires: typeof auth.expires === "number" ? auth.expires : Date.now() + 3600 * 1000,
+            });
+        }
+        catch (e) {
+            logWarn("Failed to bootstrap .qwen token from SDK auth state:", e);
+        }
+    }
     return accessToken ?? null;
 }
 /**
@@ -58,8 +80,8 @@ function getBaseUrl() {
             return getApiBaseUrl(stored.resource_url);
         }
     }
-    catch (_) {
-        // File read error, use default
+    catch (e) {
+        logWarn("Failed to load stored token for baseURL, using default:", e);
     }
     return getApiBaseUrl();
 }
@@ -91,9 +113,15 @@ export const QwenAuthPlugin = async (_input) => {
                 }
                 const accessToken = await getValidAccessToken(getAuth);
                 if (!accessToken) return null;
+                const baseURL = getBaseUrl();
+                if (LOGGING_ENABLED) {
+                    logInfo("Using Qwen baseURL:", baseURL);
+                }
                 return {
                     apiKey: accessToken,
-                    baseURL: DEFAULT_QWEN_BASE_URL,
+                    baseURL,
+                    timeout: CHAT_REQUEST_TIMEOUT_MS,
+                    maxRetries: CHAT_MAX_RETRIES,
                 };
             },
             methods: [
@@ -127,6 +155,7 @@ export const QwenAuthPlugin = async (_input) => {
                                 const maxInterval = DEVICE_FLOW.MAX_POLL_INTERVAL;
                                 const startTime = Date.now();
                                 const expiresIn = deviceAuth.expires_in * 1000;
+                                let consecutivePollFailures = 0;
                                 while (Date.now() - startTime < expiresIn) {
                                     await new Promise(resolve => setTimeout(resolve, pollInterval + POLLING_MARGIN_MS));
                                     const result = await pollForToken(deviceAuth.device_code, pkce.verifier);
@@ -141,13 +170,39 @@ export const QwenAuthPlugin = async (_input) => {
                                         };
                                     }
                                     if (result.type === "slow_down") {
+                                        consecutivePollFailures = 0;
                                         pollInterval = Math.min(pollInterval + 5000, maxInterval);
                                         continue;
                                     }
                                     if (result.type === "pending") {
+                                        consecutivePollFailures = 0;
                                         continue;
                                     }
-                                    // denied, expired, failed -> stop
+                                    if (result.type === "failed") {
+                                        if (result.fatal) {
+                                            logError("OAuth token polling failed with fatal error", {
+                                                status: result.status,
+                                                error: result.error,
+                                                description: result.description,
+                                            });
+                                            return { type: "failed" };
+                                        }
+                                        consecutivePollFailures += 1;
+                                        logWarn(`OAuth token polling failed (${consecutivePollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`);
+                                        if (consecutivePollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+                                            console.error("[qwen-oauth-plugin] OAuth token polling failed repeatedly");
+                                            return { type: "failed" };
+                                        }
+                                        continue;
+                                    }
+                                    if (result.type === "denied") {
+                                        console.error("[qwen-oauth-plugin] Device authorization was denied");
+                                        return { type: "failed" };
+                                    }
+                                    if (result.type === "expired") {
+                                        console.error("[qwen-oauth-plugin] Device authorization code expired");
+                                        return { type: "failed" };
+                                    }
                                     return { type: "failed" };
                                 }
                                 console.error("[qwen-oauth-plugin] Device authorization timed out");
@@ -168,7 +223,11 @@ export const QwenAuthPlugin = async (_input) => {
             providers[PROVIDER_ID] = {
                 npm: "@ai-sdk/openai-compatible",
                 name: "Qwen Code",
-                options: { baseURL: "https://portal.qwen.ai/v1" },
+                options: {
+                    baseURL: getBaseUrl(),
+                    timeout: CHAT_REQUEST_TIMEOUT_MS,
+                    maxRetries: CHAT_MAX_RETRIES,
+                },
                 models: {
                     "coder-model": {
                         id: "coder-model",
@@ -192,19 +251,52 @@ export const QwenAuthPlugin = async (_input) => {
             };
             config.provider = providers;
         },
+        "chat.params": async (input, output) => {
+            try {
+                output.options = output.options || {};
+                output.options.maxRetries = CHAT_MAX_RETRIES;
+                if (typeof output.options.timeout !== "number" || output.options.timeout > CHAT_REQUEST_TIMEOUT_MS) {
+                    output.options.timeout = CHAT_REQUEST_TIMEOUT_MS;
+                }
+                if (LOGGING_ENABLED) {
+                    logInfo("Applied chat.params hotfix", {
+                        sessionID: input?.sessionID,
+                        modelID: input?.model?.id,
+                        timeout: output.options.timeout,
+                        maxRetries: output.options.maxRetries,
+                    });
+                }
+            }
+            catch (e) {
+                logWarn("Failed to apply chat params hotfix:", e);
+            }
+        },
         /**
          * Send DashScope headers like original CLI.
          * X-DashScope-CacheControl: enable prompt caching, reduce token consumption.
          * X-DashScope-AuthType: specify auth method for server.
          */
-        "chat.headers": async (_input, output) => {
+        "chat.headers": async (input, output) => {
             try {
-                if (output?.headers) {
-                    output.headers["X-DashScope-CacheControl"] = "enable";
-                    output.headers["X-DashScope-AuthType"] = "qwen-oauth";
+                output.headers = output.headers || {};
+                const requestId = randomUUID();
+                output.headers["X-DashScope-CacheControl"] = "enable";
+                output.headers[PORTAL_HEADERS.AUTH_TYPE] = PORTAL_HEADERS.AUTH_TYPE_VALUE;
+                output.headers["User-Agent"] = PLUGIN_USER_AGENT;
+                output.headers["X-DashScope-UserAgent"] = PLUGIN_USER_AGENT;
+                output.headers["x-request-id"] = requestId;
+                if (LOGGING_ENABLED) {
+                    logInfo("Applied chat.headers", {
+                        request_id: requestId,
+                        sessionID: input?.sessionID,
+                        modelID: input?.model?.id,
+                        providerID: input?.provider?.info?.id,
+                    });
                 }
             }
-            catch (_) { /* Prevent hook errors from breaking requests */ }
+            catch (e) {
+                logWarn("Failed to set chat headers:", e);
+            }
         },
     };
 };

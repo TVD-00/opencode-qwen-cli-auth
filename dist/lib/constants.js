@@ -45,7 +45,7 @@ export const HTTP_STATUS = {
  */
 export const PORTAL_HEADERS = {
     AUTH_TYPE: "X-DashScope-AuthType",
-    AUTH_TYPE_VALUE: "qwen_oauth",
+    AUTH_TYPE_VALUE: "qwen-oauth",
 };
 /** Device flow polling configuration */
 export const DEVICE_FLOW = {
@@ -95,8 +95,8 @@ export const VERIFICATION_URI = {
     /** Full query parameter for Qwen Code client */
     CLIENT_PARAM_VALUE: "client=qwen-code",
 };
-/** Token refresh buffer (refresh 5 minutes before expiry) */
-export const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // 5 minutes
+/** Token refresh buffer (refresh 30 seconds before expiry) */
+export const TOKEN_REFRESH_BUFFER_MS = 30 * 1000; // 30 seconds
 /** Stream processing configuration */
 export const STREAM_CONFIG = {
     /** Maximum buffer size for SSE pass-through mode (1MB) */

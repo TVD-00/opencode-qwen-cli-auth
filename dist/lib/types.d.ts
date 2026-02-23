@@ -68,7 +68,9 @@ export interface QwenTokenResponse {
 export interface StoredTokenData {
     access_token: string;
     refresh_token: string;
-    expires: number;
+    token_type?: string;
+    expiry_date: number;
+    expires?: number;
     resource_url?: string;
 }
 /**
@@ -86,6 +88,10 @@ export interface TokenSuccess {
  */
 export interface TokenFailure {
     type: "failed";
+    status?: number;
+    error?: string;
+    description?: string;
+    fatal?: boolean;
 }
 /**
  * Token exchange pending result (device flow)
