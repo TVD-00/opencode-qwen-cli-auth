@@ -20,7 +20,7 @@ export function getConfigPath() {
 export function loadPluginConfig() {
     const configPath = getConfigPath();
     if (!existsSync(configPath)) {
-        return { qwenMode: true }; // Default to QWEN_MODE enabled
+        return { qwenMode: true }; // Default: QWEN_MODE enabled
     }
     try {
         const content = readFileSync(configPath, "utf-8");
@@ -40,9 +40,9 @@ export function getQwenMode(config) {
     if (envValue !== undefined) {
         return envValue === "1" || envValue.toLowerCase() === "true";
     }
-    // Ep kieu boolean chac chan, tranh string "false" bi truthy
+    // Ensure boolean type, avoid string "false" being truthy
     const val = config.qwenMode;
-    if (val === undefined || val === null) return true; // mac dinh bat
+    if (val === undefined || val === null) return true; // default: enabled
     if (typeof val === "string") {
         return val === "1" || val.toLowerCase() === "true";
     }

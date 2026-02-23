@@ -30,8 +30,8 @@ export function openBrowserUrl(url) {
         });
     }
     catch (error) {
-        // Log canh bao de ho tro debug, user van co the mo URL thu cong
-        console.warn("[qwen-oauth-plugin] Khong the mo trinh duyet:", error?.message || error);
+        // Log warning for debugging, user can still open URL manually
+        console.warn("[qwen-oauth-plugin] Unable to open browser:", error?.message || error);
     }
 }
 //# sourceMappingURL=browser.js.map

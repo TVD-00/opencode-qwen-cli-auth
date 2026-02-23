@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "
 import { QWEN_OAUTH, DEFAULT_QWEN_BASE_URL, TOKEN_REFRESH_BUFFER_MS, VERIFICATION_URI } from "../constants.js";
 import { getTokenPath, getConfigDir } from "../config.js";
 import { logError, logWarn, logInfo, LOGGING_ENABLED } from "../logger.js";
-// So lan retry toi da khi refresh token that bai
+// Maximum retry attempts when token refresh fails
 const MAX_REFRESH_RETRIES = 2;
 const REFRESH_RETRY_DELAY_MS = 1000;
 /**
@@ -172,7 +172,7 @@ export async function pollForToken(deviceCode, verifier, interval = 2) {
     }
 }
 /**
- * Refresh access token using refresh token (1 lan duy nhat, khong retry)
+ * Refresh access token using refresh token (single attempt, no retry)
  * @param refreshToken - Refresh token
  * @returns Token result
  */
@@ -225,8 +225,8 @@ async function refreshAccessTokenOnce(refreshToken) {
     }
 }
 /**
- * Refresh access token voi retry logic
- * Retry toi da MAX_REFRESH_RETRIES lan voi delay giua cac lan
+ * Refresh access token with retry logic.
+ * Retries up to MAX_REFRESH_RETRIES times with delay between attempts.
  * @param refreshToken - Refresh token
  * @returns Token result
  */
@@ -236,20 +236,20 @@ export async function refreshAccessToken(refreshToken) {
         if (result.type === "success") {
             return result;
         }
-        // Neu loi 401/403 thi refresh token da bi revoke, khong can retry
+        // If 401/403 error, refresh token was revoked, no need to retry
         if (result.status === 401 || result.status === 403) {
-            logError("Refresh token bi reject (" + result.status + "), can dang nhap lai");
+            logError("Refresh token rejected (" + result.status + "), re-authentication required");
             return { type: "failed" };
         }
-        // Con retry thi cho delay roi thu lai
+        // If retries remaining, wait and try again
         if (attempt < MAX_REFRESH_RETRIES) {
             if (LOGGING_ENABLED) {
-                logInfo(`Token refresh that bai, thu lai lan ${attempt + 2}/${MAX_REFRESH_RETRIES + 1}...`);
+                logInfo(`Token refresh failed, retrying attempt ${attempt + 2}/${MAX_REFRESH_RETRIES + 1}...`);
             }
             await new Promise(resolve => setTimeout(resolve, REFRESH_RETRY_DELAY_MS));
         }
     }
-    logError("Token refresh that bai sau " + (MAX_REFRESH_RETRIES + 1) + " lan thu");
+    logError("Token refresh failed after " + (MAX_REFRESH_RETRIES + 1) + " attempts");
     return { type: "failed" };
 }
 /**
@@ -285,17 +285,17 @@ export function loadStoredToken() {
     }
 }
 /**
- * Xoa token luu tren disk khi token khong con hop le
+ * Delete token stored on disk when token is no longer valid.
  */
 export function clearStoredToken() {
     const tokenPath = getTokenPath();
     if (existsSync(tokenPath)) {
         try {
             unlinkSync(tokenPath);
-            logWarn("Da xoa token cu, can dang nhap lai");
+            logWarn("Deleted old token, re-authentication required");
         }
         catch (error) {
-            logError("Khong the xoa token file:", error);
+            logError("Unable to delete token file:", error);
         }
     }
 }
@@ -339,34 +339,34 @@ export function isTokenExpired(expiresAt) {
     return Date.now() >= expiresAt - TOKEN_REFRESH_BUFFER_MS;
 }
 /**
- * Get valid access token, refreshing if necessary
- * Khi refresh that bai, xoa token cu de user biet can dang nhap lai
+ * Get valid access token, refreshing if necessary.
+ * When refresh fails, delete old token so user knows re-authentication is needed.
  * @returns Access token and resource URL, or null if authentication required
  */
 export async function getValidToken() {
     const stored = loadStoredToken();
     if (!stored) {
-        return null; // Khong co token, can dang nhap
+        return null; // No token, authentication required
     }
-    // Token con hieu luc
+    // Token is still valid
     if (!isTokenExpired(stored.expires)) {
         return {
             accessToken: stored.access_token,
             resourceUrl: stored.resource_url,
         };
     }
-    // Token het han, thu refresh (co retry ben trong)
+    // Token expired, try refresh (has retry logic inside)
     if (LOGGING_ENABLED) {
         logInfo("Token expired, refreshing...");
     }
     const refreshResult = await refreshAccessToken(stored.refresh_token);
     if (refreshResult.type !== "success") {
         logError("Token refresh failed, re-authentication required");
-        // Xoa token cu de tranh loop loi
+        // Delete old token to avoid error loop
         clearStoredToken();
         return null;
     }
-    // Luu token moi
+    // Save new token
     saveToken(refreshResult);
     return {
         accessToken: refreshResult.access,

@@ -1,8 +1,8 @@
 /**
  * Alibaba Qwen OAuth Authentication Plugin for opencode
  *
- * Plugin don gian: chi xu ly OAuth login + tra apiKey/baseURL cho SDK.
- * SDK tu xu ly streaming, headers, request format.
+ * Simple plugin: handles OAuth login + provides apiKey/baseURL to SDK.
+ * SDK handles streaming, headers, and request format.
  *
  * @license MIT with Usage Disclaimer (see LICENSE file)
  * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
@@ -11,11 +11,11 @@ import { createPKCE, requestDeviceCode, pollForToken, getApiBaseUrl, saveToken, 
 import { PROVIDER_ID, AUTH_LABELS, DEVICE_FLOW, DEFAULT_QWEN_BASE_URL } from "./lib/constants.js";
 import { logError, logInfo, LOGGING_ENABLED } from "./lib/logger.js";
 /**
- * Lay access token hop le tu SDK auth state, refresh neu het han
- * Dung getAuth() cua SDK thay vi doc file truc tiep
+ * Get valid access token from SDK auth state, refresh if expired.
+ * Uses getAuth() from SDK instead of reading file directly.
  *
- * @param getAuth - Ham lay auth state tu SDK
- * @returns access token hoac null
+ * @param getAuth - Function to get auth state from SDK
+ * @returns Access token or null
  */
 async function getValidAccessToken(getAuth) {
     const auth = await getAuth();
@@ -23,7 +23,7 @@ async function getValidAccessToken(getAuth) {
         return null;
     }
     let accessToken = auth.access;
-    // Refresh neu het han (buffer 60 giay)
+    // Refresh if expired (60 second buffer)
     if (accessToken && auth.expires && Date.now() > auth.expires - 60000 && auth.refresh) {
         try {
             const refreshResult = await refreshAccessToken(auth.refresh);
@@ -48,8 +48,8 @@ async function getValidAccessToken(getAuth) {
     return accessToken ?? null;
 }
 /**
- * Lay base URL tu token luu tren disk (resource_url)
- * Fallback ve portal.qwen.ai/v1 neu khong co
+ * Get base URL from token stored on disk (resource_url).
+ * Falls back to portal.qwen.ai/v1 if not available.
  */
 function getBaseUrl() {
     try {
@@ -59,7 +59,7 @@ function getBaseUrl() {
         }
     }
     catch (_) {
-        // Loi doc file, dung default
+        // File read error, use default
     }
     return getApiBaseUrl();
 }
@@ -79,11 +79,11 @@ export const QwenAuthPlugin = async (_input) => {
         auth: {
             provider: PROVIDER_ID,
             /**
-             * Loader: lay token + base URL, tra ve cho SDK
-             * Pattern giong plugin tham chieu opencode-qwencode-auth
+             * Loader: get token + base URL, return to SDK.
+             * Pattern similar to opencode-qwencode-auth reference plugin.
              */
             async loader(getAuth, provider) {
-                // Zero cost cho OAuth models (mien phi)
+                // Zero cost for OAuth models (free)
                 if (provider?.models) {
                     for (const model of Object.values(provider.models)) {
                         if (model) model.cost = { input: 0, output: 0 };
@@ -111,10 +111,10 @@ export const QwenAuthPlugin = async (_input) => {
                         if (!deviceAuth) {
                             throw new Error("Failed to request device code");
                         }
-                        // Hien thi user code
+                        // Display user code
                         console.log(`\nPlease visit: ${deviceAuth.verification_uri}`);
                         console.log(`And enter code: ${deviceAuth.user_code}\n`);
-                        // URL xac thuc - SDK se tu mo browser khi method=auto
+                        // Verification URL - SDK will open browser automatically when method=auto
                         const verificationUrl = deviceAuth.verification_uri_complete || deviceAuth.verification_uri;
                         return {
                             url: verificationUrl,
@@ -132,7 +132,7 @@ export const QwenAuthPlugin = async (_input) => {
                                     const result = await pollForToken(deviceAuth.device_code, pkce.verifier);
                                     if (result.type === "success") {
                                         saveToken(result);
-                                        // Tra ve cho SDK luu auth state
+                                        // Return to SDK to save auth state
                                         return {
                                             type: "success",
                                             access: result.access,
@@ -147,7 +147,7 @@ export const QwenAuthPlugin = async (_input) => {
                                     if (result.type === "pending") {
                                         continue;
                                     }
-                                    // denied, expired, failed -> dung lai
+                                    // denied, expired, failed -> stop
                                     return { type: "failed" };
                                 }
                                 console.error("[qwen-oauth-plugin] Device authorization timed out");
@@ -159,9 +159,9 @@ export const QwenAuthPlugin = async (_input) => {
             ],
         },
         /**
-         * Dang ky provider qwen-code voi danh sach model
-         * Chi dang ky model ma Portal API (OAuth) chap nhan:
-         * coder-model va vision-model (theo QWEN_OAUTH_ALLOWED_MODELS cua CLI goc)
+         * Register qwen-code provider with model list.
+         * Only register models that Portal API (OAuth) accepts:
+         * coder-model and vision-model (according to QWEN_OAUTH_ALLOWED_MODELS from original CLI)
          */
         config: async (config) => {
             const providers = config.provider || {};
@@ -173,8 +173,8 @@ export const QwenAuthPlugin = async (_input) => {
                     "coder-model": {
                         id: "coder-model",
                         name: "Qwen Coder (Qwen 3.5 Plus)",
-                        // Qwen khong ho tro reasoning_effort tu OpenCode UI
-                        // Thinking luon bat mac dinh phia server (qwen3.5-plus)
+                        // Qwen does not support reasoning_effort from OpenCode UI
+                        // Thinking is always enabled by default on server side (qwen3.5-plus)
                         reasoning: false,
                         limit: { context: 1048576, output: 65536 },
                         cost: { input: 0, output: 0 },
@@ -193,9 +193,9 @@ export const QwenAuthPlugin = async (_input) => {
             config.provider = providers;
         },
         /**
-         * Gui header DashScope giong CLI goc
-         * X-DashScope-CacheControl: enable prompt caching, giam token tieu thu
-         * X-DashScope-AuthType: xac dinh auth method cho server
+         * Send DashScope headers like original CLI.
+         * X-DashScope-CacheControl: enable prompt caching, reduce token consumption.
+         * X-DashScope-AuthType: specify auth method for server.
          */
         "chat.headers": async (_input, output) => {
             try {
@@ -204,7 +204,7 @@ export const QwenAuthPlugin = async (_input) => {
                     output.headers["X-DashScope-AuthType"] = "qwen-oauth";
                 }
             }
-            catch (_) { /* khong de loi hook lam treo request */ }
+            catch (_) { /* Prevent hook errors from breaking requests */ }
         },
     };
 };
