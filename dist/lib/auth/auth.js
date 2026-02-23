@@ -88,7 +88,7 @@ function toStoredTokenData(data) {
             : typeof raw.expiry_date === "string"
                 ? Number(raw.expiry_date)
                 : undefined;
-    const resourceUrl = typeof raw.resource_url === "string" ? raw.resource_url : undefined;
+    const resourceUrl = typeof raw.resource_url === "string" ? normalizeResourceUrl(raw.resource_url) : undefined;
     if (!accessToken || !refreshToken || typeof expiryDate !== "number" || !Number.isFinite(expiryDate) || expiryDate <= 0) {
         return null;
     }
@@ -470,7 +470,10 @@ export function loadStoredToken() {
             logWarn("Invalid token data, re-authentication required");
             return null;
         }
-        const needsRewrite = typeof parsed.expiry_date !== "number" || typeof parsed.token_type !== "string" || typeof parsed.expires === "number";
+        const needsRewrite = typeof parsed.expiry_date !== "number" ||
+            typeof parsed.token_type !== "string" ||
+            typeof parsed.expires === "number" ||
+            parsed.resource_url !== normalized.resource_url;
         if (needsRewrite) {
             try {
                 writeStoredTokenData(normalized);
@@ -510,7 +513,7 @@ export function saveToken(tokenResult) {
         refresh_token: tokenResult.refresh,
         token_type: "Bearer",
         expiry_date: tokenResult.expires,
-        resource_url: tokenResult.resourceUrl,
+        resource_url: normalizeResourceUrl(tokenResult.resourceUrl),
     };
     try {
         writeStoredTokenData(tokenData);
@@ -551,12 +554,17 @@ export async function getValidToken() {
 export function getApiBaseUrl(resourceUrl) {
     if (resourceUrl) {
         try {
-            const url = new URL(resourceUrl);
+            const normalizedResourceUrl = normalizeResourceUrl(resourceUrl);
+            if (!normalizedResourceUrl) {
+                logWarn("Invalid resource_url, using default Portal API URL");
+                return DEFAULT_QWEN_BASE_URL;
+            }
+            const url = new URL(normalizedResourceUrl);
             if (!url.protocol.startsWith("http")) {
                 logWarn("Invalid resource_url protocol, using default Portal API URL");
                 return DEFAULT_QWEN_BASE_URL;
             }
-            let baseUrl = resourceUrl.replace(/\/$/, "");
+            let baseUrl = normalizedResourceUrl.replace(/\/$/, "");
             const suffix = "/v1";
             if (!baseUrl.endsWith(suffix)) {
                 baseUrl = `${baseUrl}${suffix}`;
