@@ -177,6 +177,7 @@ export const QwenAuthPlugin = async (_input) => {
                         limit: { context: 1048576, output: 65536 },
                         cost: { input: 0, output: 0 },
                         modalities: { input: ["text"], output: ["text"] },
+                        options: { extraBody: { enable_thinking: true } },
                     },
                     "vision-model": {
                         id: "vision-model",
