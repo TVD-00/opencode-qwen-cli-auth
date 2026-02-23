@@ -3,8 +3,8 @@
  */
 /** Plugin identifier */
 export const PLUGIN_NAME = "qwen-oauth-plugin";
-/** Provider ID for opencode configuration (used in model references like alibaba/coder-model) */
-export const PROVIDER_ID = "alibaba";
+/** Provider ID for opencode configuration (used in model references like qwen-code/coder-model) */
+export const PROVIDER_ID = "qwen-code";
 /** Dummy API key (actual auth via OAuth) */
 export const DUMMY_API_KEY = "qwen-oauth";
 /**
@@ -85,7 +85,7 @@ export const PLATFORM_OPENERS = {
 };
 /** OAuth authorization labels */
 export const AUTH_LABELS = {
-    OAUTH: "Qwen Account (OAuth)",
+    OAUTH: "Qwen Code (qwen.ai OAuth)",
     INSTRUCTIONS: "Visit the URL shown in your browser to complete authentication.",
 };
 /** OAuth verification URI parameters */

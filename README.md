@@ -31,7 +31,7 @@ Add the plugin to your OpenCode config:
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": ["opencode-qwen-cli-auth"],
-  "model": "alibaba/coder-model"
+  "model": "qwen-code/coder-model"
 }
 ```
 
@@ -41,16 +41,16 @@ Then sign in:
 opencode auth login
 ```
 
-Choose `Alibaba` -> `Qwen Account (OAuth)`.
+Choose `Qwen Code` -> `Qwen Code (qwen.ai OAuth)`.
 
 ## Usage
 
 ```bash
-opencode run "create a hello world file" --model=alibaba/coder-model
-opencode chat --model=alibaba/coder-model
+opencode run "create a hello world file" --model=qwen-code/coder-model
+opencode chat --model=qwen-code/coder-model
 ```
 
-Always keep the provider prefix `alibaba/` in model configuration.
+Always keep the provider prefix `qwen-code/` in model configuration.
 
 ## Configuration
 
@@ -120,7 +120,7 @@ The server is throttling requests. Reduce request frequency and retry later.
 Ensure your model is set correctly in OpenCode:
 
 ```yaml
-model: alibaba/coder-model
+model: qwen-code/coder-model
 ```
 
 ## Clear auth state

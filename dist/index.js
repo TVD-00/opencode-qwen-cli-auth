@@ -8,7 +8,7 @@
  * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
  */
 import { createPKCE, requestDeviceCode, pollForToken, getApiBaseUrl, saveToken, refreshAccessToken, loadStoredToken } from "./lib/auth/auth.js";
-import { PROVIDER_ID, AUTH_LABELS, DEVICE_FLOW } from "./lib/constants.js";
+import { PROVIDER_ID, AUTH_LABELS, DEVICE_FLOW, DEFAULT_QWEN_BASE_URL } from "./lib/constants.js";
 import { logError, logInfo, LOGGING_ENABLED } from "./lib/logger.js";
 /**
  * Lay access token hop le tu SDK auth state, refresh neu het han
@@ -70,7 +70,7 @@ function getBaseUrl() {
  * ```json
  * {
  *   "plugin": ["opencode-alibaba-qwen-cli-auth"],
- *   "model": "alibaba/coder-model"
+ *   "model": "qwen-code/coder-model"
  * }
  * ```
  */
@@ -80,23 +80,20 @@ export const QwenAuthPlugin = async (_input) => {
             provider: PROVIDER_ID,
             /**
              * Loader: lay token + base URL, tra ve cho SDK
-             * Khong can custom fetch - SDK tu xu ly streaming va headers
+             * Pattern giong plugin tham chieu opencode-qwencode-auth
              */
             async loader(getAuth, provider) {
-                const auth = await getAuth();
-                // Chi xu ly OAuth, bo qua API key auth
-                if (auth.type !== "oauth") {
-                    return {};
+                // Zero cost cho OAuth models (mien phi)
+                if (provider?.models) {
+                    for (const model of Object.values(provider.models)) {
+                        if (model) model.cost = { input: 0, output: 0 };
+                    }
                 }
                 const accessToken = await getValidAccessToken(getAuth);
-                if (!accessToken) {
-                    return null;
-                }
-                const baseUrl = getBaseUrl();
-                // Tra ve apiKey + baseURL, SDK tu xu ly phan con lai
+                if (!accessToken) return null;
                 return {
                     apiKey: accessToken,
-                    baseURL: baseUrl,
+                    baseURL: DEFAULT_QWEN_BASE_URL,
                 };
             },
             methods: [
@@ -160,6 +157,52 @@ export const QwenAuthPlugin = async (_input) => {
                     },
                 },
             ],
+        },
+        /**
+         * Dang ky provider qwen-code voi danh sach model
+         * Chi dang ky model ma Portal API (OAuth) chap nhan:
+         * coder-model va vision-model (theo QWEN_OAUTH_ALLOWED_MODELS cua CLI goc)
+         */
+        config: async (config) => {
+            const providers = config.provider || {};
+            providers[PROVIDER_ID] = {
+                npm: "@ai-sdk/openai-compatible",
+                name: "Qwen Code",
+                options: { baseURL: "https://portal.qwen.ai/v1" },
+                models: {
+                    "coder-model": {
+                        id: "coder-model",
+                        name: "Qwen Coder (Qwen 3.5 Plus)",
+                        reasoning: true,
+                        limit: { context: 1048576, output: 65536 },
+                        cost: { input: 0, output: 0 },
+                        modalities: { input: ["text"], output: ["text"] },
+                    },
+                    "vision-model": {
+                        id: "vision-model",
+                        name: "Qwen VL Plus (vision)",
+                        reasoning: false,
+                        limit: { context: 131072, output: 8192 },
+                        cost: { input: 0, output: 0 },
+                        modalities: { input: ["text"], output: ["text"] },
+                    },
+                },
+            };
+            config.provider = providers;
+        },
+        /**
+         * Gui header DashScope giong CLI goc
+         * X-DashScope-CacheControl: enable prompt caching, giam token tieu thu
+         * X-DashScope-AuthType: xac dinh auth method cho server
+         */
+        "chat.headers": async (_input, output) => {
+            try {
+                if (output?.headers) {
+                    output.headers["X-DashScope-CacheControl"] = "enable";
+                    output.headers["X-DashScope-AuthType"] = "qwen-oauth";
+                }
+            }
+            catch (_) { /* khong de loi hook lam treo request */ }
         },
     };
 };

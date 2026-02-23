@@ -12,7 +12,7 @@ import type { Plugin } from "@opencode-ai/plugin";
  * ```json
  * {
  *   "plugin": ["opencode-alibaba-qwen-cli-auth"],
- *   "model": "alibaba/coder-model"
+ *   "model": "qwen-code/coder-model"
  * }
  * ```
  */

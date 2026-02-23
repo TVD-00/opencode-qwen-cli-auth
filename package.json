@@ -1,7 +1,7 @@
 {
   "name": "opencode-qwen-cli-auth",
-  "version": "1.0.0",
-  "description": "Alibaba Qwen OAuth authentication plugin for opencode - use your Qwen account instead of API keys",
+  "version": "2.1.1",
+  "description": "Qwen OAuth authentication plugin for opencode - use your Qwen account instead of API keys",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "type": "module",

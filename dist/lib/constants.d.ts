@@ -3,8 +3,8 @@
  */
 /** Plugin identifier */
 export declare const PLUGIN_NAME = "qwen-oauth-plugin";
-/** Provider ID for opencode configuration (used in model references like alibaba/coder-model) */
-export declare const PROVIDER_ID = "alibaba";
+/** Provider ID for opencode configuration (used in model references like qwen-code/coder-model) */
+export declare const PROVIDER_ID = "qwen-code";
 /** Dummy API key (actual auth via OAuth) */
 export declare const DUMMY_API_KEY = "qwen-oauth";
 /**
