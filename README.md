@@ -1,31 +1,10 @@
-# opencode-qwen-cli-auth
-OAuth plugin for OpenCode that lets you use Qwen models with your Qwen account, without managing a DashScope API key directly.
+# opencode-qwen-cli-auth (local fork)
 
-## Scope
+Plugin OAuth cho **OpenCode** để dùng Qwen theo cơ chế giống **qwen-code CLI** (free tier bằng Qwen account), không cần DashScope API key.
 
-- Uses OAuth Device Authorization Grant (RFC 8628) for sign-in.
-- Best suited for personal/dev workflows.
-- For production or commercial workloads, use DashScope API key auth instead:
-  https://dashscope.console.aliyun.com/
+## Cấu hình nhanh
 
-## Features
-
-- OAuth login through `opencode auth login`.
-- Automatic token refresh before expiration.
-- Dynamic API base URL from token `resource_url` with safe fallback.
-- Model normalization to `coder-model` for Qwen Portal API.
-- Optional prompt bridge behavior via `QWEN_MODE`.
-- Optional debug and request logging via environment variables.
-
-## Requirements
-
-- Qwen account
-- OpenCode
-- Node.js `>=20` (only required when building/testing from source)
-
-## Quick start
-
-Add the plugin to your OpenCode config:
+`opencode.json`:
 
 ```json
 {
@@ -35,128 +14,49 @@ Add the plugin to your OpenCode config:
 }
 ```
 
-Then sign in:
+Đăng nhập:
 
 ```bash
 opencode auth login
 ```
 
-Choose `Qwen Code` -> `Qwen Code (qwen.ai OAuth)`.
+Chọn provider **Qwen Code (qwen.ai OAuth)**.
 
-## Usage
+## Vì sao plugin trước bị `insufficient_quota`?
 
-```bash
-opencode run "create a hello world file" --model=qwen-code/coder-model
-opencode chat --model=qwen-code/coder-model
-```
+Từ việc đối chiếu với **qwen-code** (gốc), request free-tier cần:
 
-Always keep the provider prefix `qwen-code/` in model configuration.
+- Base URL đúng (DashScope OpenAI-compatible):
+  - mặc định: `https://dashscope.aliyuncs.com/compatible-mode/v1`
+  - có thể thay đổi theo `resource_url` trong `~/.qwen/oauth_creds.json`
+- Headers DashScope đặc thù:
+  - `X-DashScope-AuthType: qwen-oauth`
+  - `X-DashScope-CacheControl: enable`
+  - `User-Agent` + `X-DashScope-UserAgent`
+- Giới hạn output token theo model (qwen-code):
+  - `coder-model`: 65536
+  - `vision-model`: 8192
 
-## Configuration
+Fork này đã **inject headers ở tầng fetch** để vẫn hoạt động ngay cả khi OpenCode không gọi hook `chat.headers`.
 
-### `QWEN_MODE`
-
-Resolution order:
-
-1. Environment variable `QWEN_MODE`
-2. File `~/.opencode/qwen/auth-config.json`
-3. Default value: `true`
-
-Example `~/.opencode/qwen/auth-config.json`:
-
-```json
-{
-  "qwenMode": true
-}
-```
-
-Supported env values:
-
-- Enable: `QWEN_MODE=1` or `QWEN_MODE=true`
-- Disable: `QWEN_MODE=0` or `QWEN_MODE=false`
-
-## Logging and debug
-
-- Enable debug logs:
+## Debug / logging
 
 ```bash
-DEBUG_QWEN_PLUGIN=1 opencode run "your prompt"
-```
-
-- Enable request logging to files:
-
-```bash
-ENABLE_PLUGIN_REQUEST_LOGGING=1 opencode run "your prompt"
+DEBUG_QWEN_PLUGIN=1 opencode run "hello" --model=qwen-code/coder-model
+ENABLE_PLUGIN_REQUEST_LOGGING=1 opencode run "hello" --model=qwen-code/coder-model
 ```
 
 Log path: `~/.opencode/logs/qwen-plugin/`
 
-## Local plugin data
+## Clear auth
 
-- OAuth token: `~/.opencode/qwen/oauth_token.json`
-- Plugin config: `~/.opencode/qwen/auth-config.json`
-- Prompt cache: `~/.opencode/cache/`
-
-## Troubleshooting
-
-### `Authentication required. Please run: opencode auth login`
-
-Token is missing or refresh failed. Re-authenticate:
-
-```bash
-opencode auth login
-```
-
-### Device authorization timed out
-
-The device code expired or was not confirmed in time. Run `opencode auth login` again and confirm in the browser sooner.
-
-### `429` rate limit
-
-The server is throttling requests. Reduce request frequency and retry later.
-
-### Wrong model behavior
-
-Ensure your model is set correctly in OpenCode:
-
-```yaml
-model: qwen-code/coder-model
-```
-
-## Clear auth state
-
-- macOS/Linux:
-
-```bash
-rm -rf ~/.opencode/qwen/
-```
-
-- PowerShell:
+PowerShell:
 
 ```powershell
 Remove-Item -Recurse -Force "$HOME/.opencode/qwen"
+Remove-Item -Recurse -Force "$HOME/.qwen"  # nếu muốn xoá token qwen-code luôn
 ```
 
-Then log in again with `opencode auth login`.
+## Ghi chú build
 
-## Development
-
-```bash
-npm run build
-npm run typecheck
-npm run test
-npm run lint
-```
-
-## Policy and links
-
-- Terms of Service: https://qwen.ai/termsservice
-- Privacy Policy: https://qwen.ai/privacypolicy
-- Usage Policy: https://qwen.ai/usagepolicy
-- NPM: https://www.npmjs.com/package/opencode-qwen-cli-auth
-- Repository: https://github.com/TVD-00/opencode-qwen-cli-auth
-- Issues: https://github.com/TVD-00/opencode-qwen-cli-auth/issues
-
-## License
-
-MIT
+Repo này chỉ chứa output `dist/` (không có `src/`/`tsconfig.json`), nên `npm run build/typecheck` sẽ không compile lại TS.

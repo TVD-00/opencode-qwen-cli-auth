@@ -556,12 +556,12 @@ export function getApiBaseUrl(resourceUrl) {
         try {
             const normalizedResourceUrl = normalizeResourceUrl(resourceUrl);
             if (!normalizedResourceUrl) {
-                logWarn("Invalid resource_url, using default Portal API URL");
+                logWarn("Invalid resource_url, using default DashScope endpoint");
                 return DEFAULT_QWEN_BASE_URL;
             }
             const url = new URL(normalizedResourceUrl);
             if (!url.protocol.startsWith("http")) {
-                logWarn("Invalid resource_url protocol, using default Portal API URL");
+                logWarn("Invalid resource_url protocol, using default DashScope endpoint");
                 return DEFAULT_QWEN_BASE_URL;
             }
             let baseUrl = normalizedResourceUrl.replace(/\/$/, "");
@@ -570,17 +570,17 @@ export function getApiBaseUrl(resourceUrl) {
                 baseUrl = `${baseUrl}${suffix}`;
             }
             if (LOGGING_ENABLED) {
-                logInfo("Constructed Portal API base URL from resource_url:", baseUrl);
+                logInfo("Constructed DashScope base URL from resource_url:", baseUrl);
             }
             return baseUrl;
         }
         catch (error) {
-            logWarn("Invalid resource_url format, using default Portal API URL:", error);
+            logWarn("Invalid resource_url format, using default DashScope endpoint:", error);
             return DEFAULT_QWEN_BASE_URL;
         }
     }
     if (LOGGING_ENABLED) {
-        logInfo("No resource_url provided, using default Portal API URL");
+        logInfo("No resource_url provided, using default DashScope endpoint");
     }
     return DEFAULT_QWEN_BASE_URL;
 }

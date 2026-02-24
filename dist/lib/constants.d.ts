@@ -8,15 +8,15 @@ export declare const PROVIDER_ID = "qwen-code";
 /** Dummy API key (actual auth via OAuth) */
 export declare const DUMMY_API_KEY = "qwen-oauth";
 /**
- * Default Qwen Portal API base URL (fallback if resource_url is missing)
+ * Default Qwen DashScope base URL (fallback if resource_url is missing)
  * Note: This plugin is for OAuth authentication only. For API key authentication,
  * use OpenCode's built-in DashScope support.
  *
- * IMPORTANT: Portal API uses /v1 path (not /api/v1)
+ * IMPORTANT: OAuth endpoints use /api/v1, DashScope OpenAI-compatible uses /compatible-mode/v1
  * - OAuth endpoints: /api/v1/oauth2/ (for authentication)
  * - Chat API: /v1/ (for completions)
  */
-export declare const DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1";
+export declare const DEFAULT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 /** Qwen OAuth endpoints and configuration */
 export declare const QWEN_OAUTH: {
     readonly DEVICE_CODE_URL: "https://chat.qwen.ai/api/v1/oauth2/device/code";
@@ -40,8 +40,8 @@ export declare const HTTP_STATUS: {
     readonly TOO_MANY_REQUESTS: 429;
 };
 /**
- * Portal API headers
- * Note: Portal API (OAuth) requires special header to indicate OAuth authentication
+ * DashScope headers
+ * Note: OAuth requires X-DashScope-AuthType to indicate qwen-oauth authentication
  */
 export declare const PORTAL_HEADERS: {
     readonly AUTH_TYPE: "X-DashScope-AuthType";
