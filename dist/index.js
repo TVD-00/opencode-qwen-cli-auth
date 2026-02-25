@@ -1400,7 +1400,7 @@ export const QwenAuthPlugin = async (_input) => {
                 models: {
                     "coder-model": {
                         id: "coder-model",
-                        name: "Qwen 3.5 Plus)",
+                        name: "Qwen 3.5 Plus",
                         // Qwen does not support reasoning_effort from OpenCode UI
                         // Thinking is always enabled by default on server side (qwen3.5-plus)
                         attachment: false,
