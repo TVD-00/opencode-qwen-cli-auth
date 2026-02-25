@@ -11,7 +11,7 @@
  * 
  * @license MIT with Usage Disclaimer (see LICENSE file)
  * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
- * @version 2.3.6
+ * @version 2.3.7
  */
 
 import { randomUUID } from "node:crypto";
