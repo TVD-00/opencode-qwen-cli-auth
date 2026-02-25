@@ -50,10 +50,10 @@ Plugin sẽ lưu từng lần đăng nhập thành công vào kho đa tài kho�
 
 ## Models hỗ trợ
 
-| Model | ID | Context | Max Output | Chi phí |
-|-------|-----|---------|------------|---------|
-| Qwen Coder (Qwen 3.5 Plus) | `coder-model` | 1M tokens | 65,536 tokens | Miễn phí |
-| Qwen VL Plus (Vision) | `vision-model` | 128K tokens | 8,192 tokens | Miễn phí |
+| Model | ID | Input | Output | Context | Max Output | Chi phí |
+|-------|-----|-------|--------|---------|------------|---------|
+| Qwen Coder (Qwen 3.5 Plus) | `coder-model` | text | text | 1M tokens | 65,536 tokens | Miễn phí |
+| Qwen VL Plus (Vision) | `vision-model` | text, image | text | 128K tokens | 8,192 tokens | Miễn phí |
 
 ## Cấu hình
 
@@ -67,7 +67,7 @@ Plugin sẽ lưu từng lần đăng nhập thành công vào kho đa tài kho�
 | `ENABLE_PLUGIN_REQUEST_LOGGING=1` | Bật ghi log request ra file | Tùy chọn |
 | `OPENCODE_QWEN_ENABLE_CLI_FALLBACK=1` | Bật tính năng gọi CLI khi hết quota | Tùy chọn |
 | `OPENCODE_QWEN_ACCOUNTS_PATH` | Ghi đè đường dẫn kho đa tài khoản (phải nằm trong `~/.qwen`) | Tùy chọn |
-| `OPENCODE_QWEN_QUOTA_COOLDOWN_MS` | Thời gian cooldown cho tài khoản đã hết quota | Mặc định: `1800000` (30 phút) |
+| `OPENCODE_QWEN_QUOTA_COOLDOWN_MS` | Thời gian cooldown cho tài khoản đã hết quota | Mặc định: `86400000` (24 giờ) |
 
 ### Debug & Logging
 
@@ -124,7 +124,8 @@ Khi gặp lỗi `429 insufficient_quota`, plugin sẽ tự động:
 1. **Đánh dấu tài khoản hiện tại đã hết quota** trong cửa sổ cooldown
 2. **Đổi sang tài khoản khỏe tiếp theo** và retry với payload ban đầu
 3. **Degrade payload** nếu không còn tài khoản khỏe để đổi
-4. **CLI fallback** (tùy chọn) - gọi `qwen` CLI nếu biến `OPENCODE_QWEN_ENABLE_CLI_FALLBACK=1` được bật
+4. **CLI fallback** (tùy chọn) - chỉ gọi `qwen` CLI cho payload chỉ có text khi bật `OPENCODE_QWEN_ENABLE_CLI_FALLBACK=1`
+5. **Guard multimodal an toàn** - bỏ qua CLI fallback khi payload có phần non-text (image/audio/file/video) để tránh mất ngữ nghĩa
 
 ### Token Hết Hạn
 

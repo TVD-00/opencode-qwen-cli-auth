@@ -50,10 +50,10 @@ The plugin stores each successful login in the multi-account store and can auto-
 
 ## Supported Models
 
-| Model | ID | Context | Max Output | Cost |
-|-------|-----|---------|------------|---------|
-| Qwen Coder (Qwen 3.5 Plus) | `coder-model` | 1M tokens | 65,536 tokens | Free |
-| Qwen VL Plus (Vision) | `vision-model` | 128K tokens | 8,192 tokens | Free |
+| Model | ID | Input | Output | Context | Max Output | Cost |
+|-------|-----|-------|--------|---------|------------|---------|
+| Qwen Coder (Qwen 3.5 Plus) | `coder-model` | text | text | 1M tokens | 65,536 tokens | Free |
+| Qwen VL Plus (Vision) | `vision-model` | text, image | text | 128K tokens | 8,192 tokens | Free |
 
 ## Configuration
 
@@ -67,7 +67,7 @@ The plugin stores each successful login in the multi-account store and can auto-
 | `ENABLE_PLUGIN_REQUEST_LOGGING=1` | Enable request logging to file | Optional |
 | `OPENCODE_QWEN_ENABLE_CLI_FALLBACK=1` | Enable CLI fallback on quota error | Optional |
 | `OPENCODE_QWEN_ACCOUNTS_PATH` | Override multi-account store path (must be inside `~/.qwen`) | Optional |
-| `OPENCODE_QWEN_QUOTA_COOLDOWN_MS` | Cooldown for exhausted accounts | Default: `1800000` (30 min) |
+| `OPENCODE_QWEN_QUOTA_COOLDOWN_MS` | Cooldown for exhausted accounts | Default: `86400000` (24h) |
 
 ### Debug & Logging
 
@@ -124,7 +124,8 @@ When hitting a `429 insufficient_quota` error, the plugin automatically:
 1. **Marks current account exhausted** for cooldown window
 2. **Switches to next healthy account** and retries with same payload
 3. **Degrades payload** if no healthy account can be switched
-4. **CLI fallback** (optional) - invokes `qwen` CLI if `OPENCODE_QWEN_ENABLE_CLI_FALLBACK=1` is set
+4. **CLI fallback** (optional) - invokes `qwen` CLI only for text-only payloads when `OPENCODE_QWEN_ENABLE_CLI_FALLBACK=1` is set
+5. **Multimodal safety guard** - skips CLI fallback for non-text parts (image/audio/file/video) to avoid semantic loss
 
 ### Token Expiration
 

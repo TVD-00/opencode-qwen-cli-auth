@@ -30,7 +30,7 @@ const LOCK_MAX_ATTEMPTS = 20;
 /** Account schema version for ~/.qwen/oauth_accounts.json */
 const ACCOUNT_STORE_VERSION = 1;
 /** Default cooldown when account hits insufficient_quota */
-const DEFAULT_QUOTA_COOLDOWN_MS = 30 * 60 * 1000;
+const DEFAULT_QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Checks if an error is an AbortError (from AbortController)

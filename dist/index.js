@@ -11,7 +11,7 @@
  * 
  * @license MIT with Usage Disclaimer (see LICENSE file)
  * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
- * @version 2.2.9
+ * @version 2.3.5
  */
 
 import { randomUUID } from "node:crypto";
@@ -40,7 +40,7 @@ const CLI_FALLBACK_MAX_BUFFER_CHARS = 1024 * 1024;
 /** Enable CLI fallback feature via environment variable */
 const ENABLE_CLI_FALLBACK = process.env.OPENCODE_QWEN_ENABLE_CLI_FALLBACK === "1";
 /** User agent string for plugin identification */
-const PLUGIN_USER_AGENT = "opencode-qwen-cli-auth/2.2.1";
+const PLUGIN_USER_AGENT = "opencode-qwen-cli-auth/2.3.4";
 /** Output token limits per model for DashScope OAuth */
 const DASH_SCOPE_OUTPUT_LIMITS = {
     "coder-model": 65536,
@@ -490,6 +490,54 @@ function extractMessageText(content) {
         return "";
     }).filter(Boolean).join("\n").trim();
 }
+
+/**
+ * Checks whether content contains non-text parts
+ * @param {*} content - Message content
+ * @returns {boolean} True if any non-text part is present
+ */
+function hasNonTextContentPart(content) {
+    if (typeof content === "string") {
+        return false;
+    }
+    if (Array.isArray(content)) {
+        return content.some((part) => {
+            if (typeof part === "string") {
+                return false;
+            }
+            if (!part || typeof part !== "object") {
+                return true;
+            }
+            if (typeof part.text === "string") {
+                return false;
+            }
+            const partType = typeof part.type === "string" ? part.type.toLowerCase() : "";
+            if (partType === "text" && typeof part.text === "string") {
+                return false;
+            }
+            return true;
+        });
+    }
+    if (content && typeof content === "object") {
+        return typeof content.text !== "string";
+    }
+    return false;
+}
+
+/**
+ * Checks whether payload contains any multimodal message content
+ * @param {Object} payload - Request payload
+ * @returns {boolean} True if payload contains non-text message parts
+ */
+function payloadContainsNonTextMessages(payload) {
+    const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+    for (const message of messages) {
+        if (hasNonTextContentPart(message?.content)) {
+            return true;
+        }
+    }
+    return false;
+}
 /**
  * Builds prompt text from chat messages for CLI fallback
  * @param {Object} payload - Request payload with messages
@@ -691,6 +739,20 @@ function makeQwenCliCompletionResponse(model, content, context, streamMode) {
 async function runQwenCliFallback(payload, context, abortSignal) {
     const model = typeof payload?.model === "string" && payload.model.length > 0 ? payload.model : "coder-model";
     const streamMode = payload?.stream === true;
+    if (payloadContainsNonTextMessages(payload)) {
+        if (LOGGING_ENABLED) {
+            logWarn("Skipping qwen CLI fallback for multimodal payload", {
+                request_id: context.requestId,
+                sessionID: context.sessionID,
+                modelID: model,
+                accountID: context.accountID,
+            });
+        }
+        return {
+            ok: false,
+            reason: "cli_fallback_unsupported_multimodal_payload",
+        };
+    }
     const prompt = buildQwenCliPrompt(payload);
     const args = [prompt, "-o", "json", "--max-session-turns", "1", "--model", model];
     if (LOGGING_ENABLED) {
@@ -964,7 +1026,7 @@ async function failFastFetch(input, init) {
                     attempt: retryAttempt + 1,
                 });
             }
-const RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504];
+            const RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504];
             if (RETRYABLE_STATUS_CODES.includes(response.status)) {
                 if (response.status === 429) {
                     const firstBody = await response.text().catch(() => "");
@@ -1341,6 +1403,7 @@ export const QwenAuthPlugin = async (_input) => {
                         name: "Qwen Coder (Qwen 3.5 Plus)",
                         // Qwen does not support reasoning_effort from OpenCode UI
                         // Thinking is always enabled by default on server side (qwen3.5-plus)
+                        attachment: false,
                         reasoning: false,
                         limit: { context: 1048576, output: CHAT_MAX_TOKENS_CAP },
                         cost: { input: 0, output: 0 },
@@ -1349,10 +1412,11 @@ export const QwenAuthPlugin = async (_input) => {
                     "vision-model": {
                         id: "vision-model",
                         name: "Qwen VL Plus (vision)",
+                        attachment: true,
                         reasoning: false,
                         limit: { context: 131072, output: DASH_SCOPE_OUTPUT_LIMITS["vision-model"] },
                         cost: { input: 0, output: 0 },
-                        modalities: { input: ["text"], output: ["text"] },
+                        modalities: { input: ["text", "image"], output: ["text"] },
                     },
                 },
             };
