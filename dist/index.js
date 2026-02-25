@@ -11,7 +11,7 @@
  * 
  * @license MIT with Usage Disclaimer (see LICENSE file)
  * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
- * @version 2.3.5
+ * @version 2.3.6
  */
 
 import { randomUUID } from "node:crypto";
@@ -1400,7 +1400,7 @@ export const QwenAuthPlugin = async (_input) => {
                 models: {
                     "coder-model": {
                         id: "coder-model",
-                        name: "Qwen Coder (Qwen 3.5 Plus)",
+                        name: "Qwen 3.5 Plus)",
                         // Qwen does not support reasoning_effort from OpenCode UI
                         // Thinking is always enabled by default on server side (qwen3.5-plus)
                         attachment: false,
@@ -1411,7 +1411,7 @@ export const QwenAuthPlugin = async (_input) => {
                     },
                     "vision-model": {
                         id: "vision-model",
-                        name: "Qwen VL Plus (vision)",
+                        name: "Qwen Vision",
                         attachment: true,
                         reasoning: false,
                         limit: { context: 131072, output: DASH_SCOPE_OUTPUT_LIMITS["vision-model"] },
