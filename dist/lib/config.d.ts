@@ -30,6 +30,14 @@ export declare function getTokenPath(): string;
  */
 export declare function getTokenLockPath(): string;
 /**
+ * Get multi-account storage path
+ */
+export declare function getAccountsPath(): string;
+/**
+ * Get multi-account lock path
+ */
+export declare function getAccountsLockPath(): string;
+/**
  * Get legacy token storage path used by old plugin versions
  */
 export declare function getLegacyTokenPath(): string;

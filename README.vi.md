@@ -7,6 +7,7 @@ Plugin OAuth cho [OpenCode](https://opencode.ai) để sử dụng Qwen miễn p
 - **OAuth 2.0 Device Authorization Grant** (RFC 8628) - đăng nhập bằng Qwen Account
 - **Không cần API key** - sử dụng free tier của Qwen
 - **Tự động refresh token** khi hết hạn
+- **Hỗ trợ đa tài khoản** - thêm nhiều Qwen account và duy trì một tài khoản active
 - **Tương thích DashScope** - tự động inject headers cần thiết cho OAuth flow
 - **Giới hạn output token thông minh** - tự động cap theo model (65K cho coder-model, 8K cho vision-model)
 - **Retry & Fallback** - xử lý lỗi quota/rate limit với cơ chế degrade (giảm tải payload)
@@ -44,6 +45,9 @@ Chọn provider **Qwen Code (qwen.ai OAuth)** và làm theo hướng dẫn:
 2. Nhập mã code được cung cấp
 3. Plugin sẽ tự động poll và lưu token
 
+Để thêm tài khoản mới, chạy lại `opencode auth login`.  
+Plugin sẽ lưu từng lần đăng nhập thành công vào kho đa tài khoản và có thể tự động đổi tài khoản khi hết quota.
+
 ## Models hỗ trợ
 
 | Model | ID | Context | Max Output | Chi phí |
@@ -62,6 +66,8 @@ Chọn provider **Qwen Code (qwen.ai OAuth)** và làm theo hướng dẫn:
 | `DEBUG_QWEN_PLUGIN=1` | Bật debug logging | Tùy chọn |
 | `ENABLE_PLUGIN_REQUEST_LOGGING=1` | Bật ghi log request ra file | Tùy chọn |
 | `OPENCODE_QWEN_ENABLE_CLI_FALLBACK=1` | Bật tính năng gọi CLI khi hết quota | Tùy chọn |
+| `OPENCODE_QWEN_ACCOUNTS_PATH` | Ghi đè đường dẫn kho đa tài khoản (phải nằm trong `~/.qwen`) | Tùy chọn |
+| `OPENCODE_QWEN_QUOTA_COOLDOWN_MS` | Thời gian cooldown cho tài khoản đã hết quota | Mặc định: `1800000` (30 phút) |
 
 ### Debug & Logging
 
@@ -95,6 +101,8 @@ File log được lưu tại: `~/.opencode/logs/qwen-plugin/`
 - **Định dạng**: JSON chứa access_token, refresh_token, expiry_date, resource_url
 - **Tự động refresh**: Kích hoạt khi token còn dưới 30 giây là hết hạn
 - **Cơ chế khóa (Lock)**: Đảm bảo an toàn khi refresh token trong môi trường đa tiến trình (multi-process)
+- **Kho đa tài khoản**: `~/.qwen/oauth_accounts.json`
+- **Lock đa tài khoản**: `~/.qwen/oauth_accounts.lock`
 
 ### Headers Bắt buộc
 
@@ -113,9 +121,10 @@ X-DashScope-UserAgent: opencode-qwen-cli-auth/{version}
 
 Khi gặp lỗi `429 insufficient_quota`, plugin sẽ tự động:
 
-1. **Degrade payload** - loại bỏ mảng tools, giảm max_tokens xuống 1024
-2. **Retry** - thử gọi lại API với payload đã giảm tải
-3. **CLI fallback** (tùy chọn) - gọi `qwen` CLI nếu biến `OPENCODE_QWEN_ENABLE_CLI_FALLBACK=1` được bật
+1. **Đánh dấu tài khoản hiện tại đã hết quota** trong cửa sổ cooldown
+2. **Đổi sang tài khoản khỏe tiếp theo** và retry với payload ban đầu
+3. **Degrade payload** nếu không còn tài khoản khỏe để đổi
+4. **CLI fallback** (tùy chọn) - gọi `qwen` CLI nếu biến `OPENCODE_QWEN_ENABLE_CLI_FALLBACK=1` được bật
 
 ### Token Hết Hạn
 
@@ -130,6 +139,9 @@ Khi gặp lỗi `429 insufficient_quota`, plugin sẽ tự động:
 ```bash
 # Xem token đang được lưu
 cat ~/.qwen/oauth_creds.json
+
+# Xem kho đa tài khoản
+cat ~/.qwen/oauth_accounts.json
 ```
 
 ### Xóa xác thực

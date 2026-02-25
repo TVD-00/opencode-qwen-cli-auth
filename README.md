@@ -7,6 +7,7 @@ OAuth plugin for [OpenCode](https://opencode.ai) to use Qwen for free via Qwen A
 - **OAuth 2.0 Device Authorization Grant** (RFC 8628) - login with your Qwen Account
 - **No API key required** - utilize Qwen's free tier
 - **Automatic token refresh** when expired
+- **Multi-account support** - add multiple Qwen accounts and keep one active account
 - **DashScope compatibility** - automatically injects required headers for the OAuth flow
 - **Smart output token limit** - auto-caps tokens based on model (65K for coder-model, 8K for vision-model)
 - **Retry & Fallback** - handles quota/rate limit errors with payload degradation mechanism
@@ -44,6 +45,9 @@ Select provider **Qwen Code (qwen.ai OAuth)** and follow the instructions:
 2. Enter the provided code
 3. The plugin will automatically poll and save the token
 
+To add more accounts, run `opencode auth login` again.  
+The plugin stores each successful login in the multi-account store and can auto-switch on quota exhaustion.
+
 ## Supported Models
 
 | Model | ID | Context | Max Output | Cost |
@@ -62,6 +66,8 @@ Select provider **Qwen Code (qwen.ai OAuth)** and follow the instructions:
 | `DEBUG_QWEN_PLUGIN=1` | Enable debug logging | Optional |
 | `ENABLE_PLUGIN_REQUEST_LOGGING=1` | Enable request logging to file | Optional |
 | `OPENCODE_QWEN_ENABLE_CLI_FALLBACK=1` | Enable CLI fallback on quota error | Optional |
+| `OPENCODE_QWEN_ACCOUNTS_PATH` | Override multi-account store path (must be inside `~/.qwen`) | Optional |
+| `OPENCODE_QWEN_QUOTA_COOLDOWN_MS` | Cooldown for exhausted accounts | Default: `1800000` (30 min) |
 
 ### Debug & Logging
 
@@ -95,6 +101,8 @@ Log files are stored at: `~/.opencode/logs/qwen-plugin/`
 - **Format**: JSON with access_token, refresh_token, expiry_date, resource_url
 - **Auto-refresh**: Triggered when less than 30 seconds to expiration
 - **Lock mechanism**: Safe multi-process token refresh
+- **Multi-account store**: `~/.qwen/oauth_accounts.json`
+- **Multi-account lock**: `~/.qwen/oauth_accounts.lock`
 
 ### Required Headers
 
@@ -113,9 +121,10 @@ X-DashScope-UserAgent: opencode-qwen-cli-auth/{version}
 
 When hitting a `429 insufficient_quota` error, the plugin automatically:
 
-1. **Degrades payload** - removes tools, reduces max_tokens to 1024
-2. **Retries** - attempts request with degraded payload
-3. **CLI fallback** (optional) - invokes `qwen` CLI if `OPENCODE_QWEN_ENABLE_CLI_FALLBACK=1` is set
+1. **Marks current account exhausted** for cooldown window
+2. **Switches to next healthy account** and retries with same payload
+3. **Degrades payload** if no healthy account can be switched
+4. **CLI fallback** (optional) - invokes `qwen` CLI if `OPENCODE_QWEN_ENABLE_CLI_FALLBACK=1` is set
 
 ### Token Expiration
 
@@ -130,6 +139,9 @@ When hitting a `429 insufficient_quota` error, the plugin automatically:
 ```bash
 # View saved token
 cat ~/.qwen/oauth_creds.json
+
+# View multi-account store
+cat ~/.qwen/oauth_accounts.json
 ```
 
 ### Remove Authentication

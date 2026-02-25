@@ -39,6 +39,56 @@ export declare function clearStoredToken(): void;
  */
 export declare function saveToken(tokenResult: TokenResult): void;
 /**
+ * Upsert OAuth account into ~/.qwen/oauth_accounts.json
+ */
+export declare function upsertOAuthAccount(tokenResult: TokenResult, options?: {
+    accountId?: string;
+    accountKey?: string;
+    setActive?: boolean;
+}): Promise<{
+    accountId: string;
+    accessToken: string;
+    resourceUrl?: string;
+    exhaustedUntil: number;
+    healthyAccountCount: number;
+    totalAccountCount: number;
+} | null>;
+/**
+ * Get active OAuth account token from multi-account store
+ */
+export declare function getActiveOAuthAccount(options?: {
+    allowExhausted?: boolean;
+    requireHealthy?: boolean;
+    preferredAccountId?: string;
+}): Promise<{
+    accountId: string;
+    accessToken: string;
+    resourceUrl?: string;
+    exhaustedUntil: number;
+    healthyAccountCount: number;
+    totalAccountCount: number;
+} | null>;
+/**
+ * Mark account as exhausted by insufficient_quota
+ */
+export declare function markOAuthAccountQuotaExhausted(accountId: string, errorCode?: string): Promise<{
+    accountId: string;
+    exhaustedUntil: number;
+    healthyAccountCount: number;
+    totalAccountCount: number;
+} | null>;
+/**
+ * Switch active account to next healthy one
+ */
+export declare function switchToNextHealthyOAuthAccount(excludedAccountIds?: string[]): Promise<{
+    accountId: string;
+    accessToken: string;
+    resourceUrl?: string;
+    exhaustedUntil: number;
+    healthyAccountCount: number;
+    totalAccountCount: number;
+} | null>;
+/**
  * Check if token is expired (with 5 minute buffer)
  * @param expiresAt - Expiration timestamp in milliseconds
  * @returns True if token is expired or will expire soon

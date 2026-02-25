@@ -17,7 +17,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { createPKCE, requestDeviceCode, pollForToken, getApiBaseUrl, saveToken, refreshAccessToken, loadStoredToken, getValidToken } from "./lib/auth/auth.js";
+import { createPKCE, requestDeviceCode, pollForToken, getApiBaseUrl, saveToken, refreshAccessToken, loadStoredToken, getValidToken, upsertOAuthAccount, getActiveOAuthAccount, markOAuthAccountQuotaExhausted, switchToNextHealthyOAuthAccount } from "./lib/auth/auth.js";
 import { PROVIDER_ID, AUTH_LABELS, DEVICE_FLOW, PORTAL_HEADERS } from "./lib/constants.js";
 import { logError, logInfo, logWarn, LOGGING_ENABLED } from "./lib/logger.js";
 
@@ -46,6 +46,7 @@ const DASH_SCOPE_OUTPUT_LIMITS = {
     "coder-model": 65536,
     "vision-model": 8192,
 };
+let ACTIVE_OAUTH_ACCOUNT_ID = null;
 function capPayloadMaxTokens(payload) {
     if (!payload || typeof payload !== "object") {
         return payload;
@@ -125,7 +126,7 @@ function resolveQwenCliCommand() {
     return "qwen";
 }
 const QWEN_CLI_COMMAND = resolveQwenCliCommand();
-function shouldUseShell(command) {
+function requiresShellExecution(command) {
     return process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
 }
 function makeFailFastErrorResponse(status, code, message) {
@@ -252,6 +253,67 @@ function getHeaderValue(headers, headerName) {
     }
     return undefined;
 }
+
+function applyAuthorizationHeader(requestInit, accessToken) {
+    if (typeof accessToken !== "string" || accessToken.length === 0) {
+        return;
+    }
+    const bearer = `Bearer ${accessToken}`;
+    if (!requestInit.headers) {
+        requestInit.headers = { authorization: bearer };
+        return;
+    }
+    if (requestInit.headers instanceof Headers) {
+        requestInit.headers.set("authorization", bearer);
+        return;
+    }
+    if (Array.isArray(requestInit.headers)) {
+        const existing = requestInit.headers.findIndex(([name]) => String(name).toLowerCase() === "authorization");
+        if (existing >= 0) {
+            requestInit.headers[existing][1] = bearer;
+            return;
+        }
+        requestInit.headers.push(["authorization", bearer]);
+        return;
+    }
+    let existingKey = null;
+    for (const key of Object.keys(requestInit.headers)) {
+        if (key.toLowerCase() === "authorization") {
+            existingKey = key;
+            break;
+        }
+    }
+    if (existingKey) {
+        requestInit.headers[existingKey] = bearer;
+        return;
+    }
+    requestInit.headers.authorization = bearer;
+}
+
+function rewriteRequestBaseUrl(requestInput, resourceUrl) {
+    if (typeof requestInput !== "string" || typeof resourceUrl !== "string" || resourceUrl.length === 0) {
+        return requestInput;
+    }
+    try {
+        const targetBase = new URL(getApiBaseUrl(resourceUrl));
+        const current = new URL(requestInput);
+        const baseSegments = targetBase.pathname.split("/").filter(Boolean);
+        const currentSegments = current.pathname.split("/").filter(Boolean);
+        let suffix = currentSegments;
+        if (currentSegments.length >= baseSegments.length &&
+            baseSegments.every((segment, index) => currentSegments[index] === segment)) {
+            suffix = currentSegments.slice(baseSegments.length);
+        }
+        const mergedPath = [...baseSegments, ...suffix].join("/");
+        targetBase.pathname = `/${mergedPath}`.replace(/\/+/g, "/");
+        targetBase.search = current.search;
+        targetBase.hash = current.hash;
+        return targetBase.toString();
+    }
+    catch (_error) {
+        return requestInput;
+    }
+}
 /**
  * Applies JSON request body with proper content-type header
  * @param {RequestInit} requestInit - Fetch options
@@ -308,10 +370,6 @@ function parseJsonRequestBody(requestInit) {
         }
         return parsed;
     }
-    catch (_error) {
-        return null;
-    }
-}
     catch (_error) {
         return null;
     }
@@ -373,6 +431,10 @@ function createQuotaDegradedPayload(payload) {
     // Disable streaming
     if (degraded.stream !== false) {
         degraded.stream = false;
+        changed = true;
+    }
+    if ("stream_options" in degraded) {
+        delete degraded.stream_options;
         changed = true;
     }
     // Reduce max_tokens
@@ -639,6 +701,12 @@ async function runQwenCliFallback(payload, context, abortSignal) {
             command: QWEN_CLI_COMMAND,
         });
     }
+    if (requiresShellExecution(QWEN_CLI_COMMAND)) {
+        return {
+            ok: false,
+            reason: "cli_shell_execution_blocked_for_security",
+        };
+    }
     return await new Promise((resolve) => {
         let settled = false;
         let stdout = "";
@@ -646,7 +714,6 @@ async function runQwenCliFallback(payload, context, abortSignal) {
         let timer = null;
         let child = undefined;
         let abortHandler = undefined;
-        const useShell = shouldUseShell(QWEN_CLI_COMMAND);
         const finalize = (result) => {
             if (settled) {
                 return;
@@ -669,7 +736,7 @@ async function runQwenCliFallback(payload, context, abortSignal) {
         }
         try {
             child = spawn(QWEN_CLI_COMMAND, args, {
-                shell: useShell,
+                shell: false,
                 windowsHide: true,
                 stdio: ["ignore", "pipe", "pipe"],
             });
@@ -843,7 +910,7 @@ function applyDashScopeHeaders(requestInit) {
  */
 async function failFastFetch(input, init) {
     const normalized = await normalizeFetchInvocation(input, init);
-    const requestInput = normalized.requestInput;
+    let requestInput = normalized.requestInput;
     const requestInit = normalized.requestInit;
     // Always inject DashScope OAuth headers at the fetch layer.
     // This ensures compatibility across OpenCode versions.
@@ -869,12 +936,14 @@ async function failFastFetch(input, init) {
         requestId: getHeaderValue(requestInit.headers, "x-request-id"),
         sessionID,
         modelID: typeof payload?.model === "string" ? payload.model : undefined,
+        accountID: ACTIVE_OAUTH_ACCOUNT_ID,
     };
     if (LOGGING_ENABLED) {
         logInfo("Qwen request dispatch", {
             request_id: context.requestId,
             sessionID: context.sessionID,
             modelID: context.modelID,
+            accountID: context.accountID,
             max_tokens: typeof payload?.max_tokens === "number" ? payload.max_tokens : undefined,
             max_completion_tokens: typeof payload?.max_completion_tokens === "number" ? payload.max_completion_tokens : undefined,
             message_count: Array.isArray(payload?.messages) ? payload.messages.length : undefined,
@@ -890,6 +959,7 @@ async function failFastFetch(input, init) {
                     request_id: context.requestId,
                     sessionID: context.sessionID,
                     modelID: context.modelID,
+                    accountID: context.accountID,
                     status: response.status,
                     attempt: retryAttempt + 1,
                 });
@@ -899,6 +969,37 @@ const RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504];
                 if (response.status === 429) {
                     const firstBody = await response.text().catch(() => "");
                     if (payload && isInsufficientQuota(firstBody)) {
+                        if (context.accountID) {
+                            try {
+                                await markOAuthAccountQuotaExhausted(context.accountID, "insufficient_quota");
+                                const switched = await switchToNextHealthyOAuthAccount([context.accountID]);
+                                if (switched?.accessToken) {
+                                    const rotatedInit = { ...requestInit };
+                                    requestInput = rewriteRequestBaseUrl(requestInput, switched.resourceUrl);
+                                    applyAuthorizationHeader(rotatedInit, switched.accessToken);
+                                    applyAuthorizationHeader(requestInit, switched.accessToken);
+                                    context.accountID = switched.accountId;
+                                    ACTIVE_OAUTH_ACCOUNT_ID = switched.accountId;
+                                    if (LOGGING_ENABLED) {
+                                        logInfo("Switched OAuth account after insufficient_quota", {
+                                            request_id: context.requestId,
+                                            sessionID: context.sessionID,
+                                            modelID: context.modelID,
+                                            accountID: context.accountID,
+                                            healthyAccounts: switched.healthyAccountCount,
+                                            totalAccounts: switched.totalAccountCount,
+                                        });
+                                    }
+                                    response = await sendWithTimeout(requestInput, rotatedInit);
+                                    if (retryAttempt < MAX_REQUEST_RETRIES) {
+                                        continue;
+                                    }
+                                }
+                            }
+                            catch (switchError) {
+                                logWarn("Failed to switch OAuth account after insufficient_quota", switchError);
+                            }
+                        }
                         const degradedPayload = createQuotaDegradedPayload(payload);
                         if (degradedPayload) {
                             const fallbackInit = { ...requestInit };
@@ -989,25 +1090,39 @@ const RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504];
  * Uses getAuth() from SDK instead of reading file directly.
  *
  * @param {Function} getAuth - Function to get auth state from SDK
- * @returns {Promise<string|null>} Access token or null if not available
+ * @returns {Promise<{ accessToken: string, resourceUrl?: string, accountId?: string }|null>} Access token state or null
  */
 async function getValidAccessToken(getAuth) {
+    const activeOAuthAccount = await getActiveOAuthAccount({ allowExhausted: true });
+    if (activeOAuthAccount?.accessToken) {
+        return {
+            accessToken: activeOAuthAccount.accessToken,
+            resourceUrl: activeOAuthAccount.resourceUrl,
+            accountId: activeOAuthAccount.accountId,
+        };
+    }
     const diskToken = await getValidToken();
     if (diskToken?.accessToken) {
-        return diskToken.accessToken;
+        return {
+            accessToken: diskToken.accessToken,
+            resourceUrl: diskToken.resourceUrl,
+        };
     }
     const auth = await getAuth();
     if (!auth || auth.type !== "oauth") {
         return null;
     }
     let accessToken = auth.access;
+    let resourceUrl = undefined;
     // Refresh if expired (60 second buffer)
     if (accessToken && auth.expires && Date.now() > auth.expires - 60000 && auth.refresh) {
         try {
             const refreshResult = await refreshAccessToken(auth.refresh);
             if (refreshResult.type === "success") {
                 accessToken = refreshResult.access;
+                resourceUrl = refreshResult.resourceUrl;
                 saveToken(refreshResult);
+                await upsertOAuthAccount(refreshResult, { setActive: false });
             }
             else {
                 if (LOGGING_ENABLED) {
@@ -1025,18 +1140,27 @@ async function getValidAccessToken(getAuth) {
     }
     if (auth.access && auth.refresh) {
         try {
-            saveToken({
+            const sdkToken = {
                 type: "success",
                 access: accessToken || auth.access,
                 refresh: auth.refresh,
                 expires: typeof auth.expires === "number" ? auth.expires : Date.now() + 3600 * 1000,
-            });
+                resourceUrl,
+            };
+            saveToken(sdkToken);
+            await upsertOAuthAccount(sdkToken, { setActive: false });
         }
         catch (e) {
             logWarn("Failed to bootstrap .qwen token from SDK auth state:", e);
         }
     }
-    return accessToken ?? null;
+    if (!accessToken) {
+        return null;
+    }
+    return {
+        accessToken,
+        resourceUrl,
+    };
 }
 
 /**
@@ -1044,7 +1168,10 @@ async function getValidAccessToken(getAuth) {
  * Falls back to DashScope compatible-mode if not available.
  * @returns {string} DashScope API base URL
  */
-function getBaseUrl() {
+function getBaseUrl(resourceUrl) {
+    if (typeof resourceUrl === "string" && resourceUrl.length > 0) {
+        return getApiBaseUrl(resourceUrl);
+    }
     try {
         const stored = loadStoredToken();
         if (stored?.resource_url) {
@@ -1087,14 +1214,15 @@ export const QwenAuthPlugin = async (_input) => {
                         if (model) model.cost = { input: 0, output: 0 };
                     }
                 }
-                const accessToken = await getValidAccessToken(getAuth);
-                if (!accessToken) return null;
-                const baseURL = getBaseUrl();
+                const tokenState = await getValidAccessToken(getAuth);
+                if (!tokenState?.accessToken) return null;
+                ACTIVE_OAUTH_ACCOUNT_ID = tokenState.accountId || null;
+                const baseURL = getBaseUrl(tokenState.resourceUrl);
                 if (LOGGING_ENABLED) {
                     logInfo("Using Qwen baseURL:", baseURL);
                 }
                 return {
-                    apiKey: accessToken,
+                    apiKey: tokenState.accessToken,
                     baseURL,
                     timeout: CHAT_REQUEST_TIMEOUT_MS,
                     maxRetries: CHAT_MAX_RETRIES,
@@ -1138,6 +1266,8 @@ export const QwenAuthPlugin = async (_input) => {
                                     const result = await pollForToken(deviceAuth.device_code, pkce.verifier);
                                     if (result.type === "success") {
                                         saveToken(result);
+                                        const savedAccount = await upsertOAuthAccount(result, { setActive: true });
+                                        ACTIVE_OAUTH_ACCOUNT_ID = savedAccount?.accountId || ACTIVE_OAUTH_ACCOUNT_ID;
                                         // Return to SDK to save auth state
                                         return {
                                             type: "success",

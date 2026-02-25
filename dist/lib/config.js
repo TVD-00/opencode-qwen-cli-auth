@@ -5,7 +5,7 @@
  */
 
 import { homedir } from "os";
-import { join } from "path";
+import { join, resolve, relative, isAbsolute, parse, dirname } from "path";
 import { readFileSync, existsSync } from "fs";
 
 /**
@@ -23,6 +23,50 @@ export function getConfigDir() {
  */
 export function getQwenDir() {
     return join(homedir(), ".qwen");
+}
+
+const ACCOUNTS_FILENAME = "oauth_accounts.json";
+const DEFAULT_ACCOUNTS_PATH = join(getQwenDir(), ACCOUNTS_FILENAME);
+
+function isRootPath(pathValue) {
+    const parsed = parse(pathValue);
+    return pathValue === parsed.root;
+}
+
+function isPathInsideBase(pathValue, baseDir) {
+    const rel = relative(baseDir, pathValue);
+    if (rel === "") {
+        return true;
+    }
+    return !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+function resolveAccountsPathFromEnv() {
+    const envPath = process.env.OPENCODE_QWEN_ACCOUNTS_PATH;
+    if (typeof envPath !== "string" || envPath.trim().length === 0) {
+        return null;
+    }
+    const trimmed = envPath.trim();
+    if (trimmed.includes("\0")) {
+        console.warn("[qwen-oauth-plugin] Ignoring OPENCODE_QWEN_ACCOUNTS_PATH with invalid null-byte");
+        return null;
+    }
+    const resolved = resolve(trimmed);
+    if (isRootPath(resolved)) {
+        console.warn("[qwen-oauth-plugin] Ignoring OPENCODE_QWEN_ACCOUNTS_PATH pointing to root path");
+        return null;
+    }
+    const baseDir = getQwenDir();
+    if (!isPathInsideBase(resolved, baseDir)) {
+        console.warn("[qwen-oauth-plugin] Ignoring OPENCODE_QWEN_ACCOUNTS_PATH outside ~/.qwen for safety");
+        return null;
+    }
+    const parsed = parse(resolved);
+    if (!parsed.base || parsed.base.length === 0) {
+        console.warn("[qwen-oauth-plugin] Ignoring OPENCODE_QWEN_ACCOUNTS_PATH without filename");
+        return null;
+    }
+    return resolved;
 }
 
 /**
@@ -94,6 +138,26 @@ export function getTokenPath() {
  */
 export function getTokenLockPath() {
     return join(getQwenDir(), "oauth_creds.lock");
+}
+
+/**
+ * Get multi-account storage path
+ * @returns {string} Path to ~/.qwen/oauth_accounts.json or OPENCODE_QWEN_ACCOUNTS_PATH override
+ */
+export function getAccountsPath() {
+    return resolveAccountsPathFromEnv() || DEFAULT_ACCOUNTS_PATH;
+}
+
+/**
+ * Get multi-account lock path
+ * @returns {string} Path to ~/.qwen/oauth_accounts.lock (or sidecar lock for override path)
+ */
+export function getAccountsLockPath() {
+    const accountsPath = getAccountsPath();
+    if (dirname(accountsPath) !== getQwenDir()) {
+        return `${accountsPath}.lock`;
+    }
+    return join(getQwenDir(), "oauth_accounts.lock");
 }
 
 /**

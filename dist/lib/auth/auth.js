@@ -8,7 +8,7 @@
 import { generatePKCE } from "@openauthjs/openauth/pkce";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, renameSync, statSync } from "fs";
 import { QWEN_OAUTH, DEFAULT_QWEN_BASE_URL, TOKEN_REFRESH_BUFFER_MS, VERIFICATION_URI } from "../constants.js";
-import { getTokenPath, getQwenDir, getTokenLockPath, getLegacyTokenPath } from "../config.js";
+import { getTokenPath, getQwenDir, getTokenLockPath, getLegacyTokenPath, getAccountsPath, getAccountsLockPath } from "../config.js";
 import { logError, logWarn, logInfo, LOGGING_ENABLED } from "../logger.js";
 
 /** Maximum number of retries for token refresh operations */
@@ -27,6 +27,10 @@ const LOCK_BACKOFF_MULTIPLIER = 1.5;
 const LOCK_MAX_INTERVAL_MS = 2000;
 /** Maximum number of lock acquisition attempts */
 const LOCK_MAX_ATTEMPTS = 20;
+/** Account schema version for ~/.qwen/oauth_accounts.json */
+const ACCOUNT_STORE_VERSION = 1;
+/** Default cooldown when account hits insufficient_quota */
+const DEFAULT_QUOTA_COOLDOWN_MS = 30 * 60 * 1000;
 
 /**
  * Checks if an error is an AbortError (from AbortController)
@@ -172,6 +176,225 @@ function toStoredTokenData(data) {
     };
 }
 
+function getQuotaCooldownMs() {
+    const raw = process.env.OPENCODE_QWEN_QUOTA_COOLDOWN_MS;
+    if (typeof raw !== "string" || raw.trim().length === 0) {
+        return DEFAULT_QUOTA_COOLDOWN_MS;
+    }
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed < 1000) {
+        return DEFAULT_QUOTA_COOLDOWN_MS;
+    }
+    return Math.floor(parsed);
+}
+
+function normalizeAccountStore(raw) {
+    const fallback = {
+        version: ACCOUNT_STORE_VERSION,
+        activeAccountId: null,
+        accounts: [],
+    };
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        return fallback;
+    }
+    const input = raw;
+    const accounts = Array.isArray(input.accounts) ? input.accounts : [];
+    const normalizedAccounts = [];
+    for (const item of accounts) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+            continue;
+        }
+        const token = toStoredTokenData(item.token);
+        if (!token) {
+            continue;
+        }
+        const id = typeof item.id === "string" && item.id.trim().length > 0
+            ? item.id.trim()
+            : `acct_${Math.random().toString(16).slice(2)}_${Date.now().toString(36)}`;
+        const createdAt = typeof item.createdAt === "number" && Number.isFinite(item.createdAt) ? item.createdAt : Date.now();
+        const updatedAt = typeof item.updatedAt === "number" && Number.isFinite(item.updatedAt) ? item.updatedAt : createdAt;
+        const exhaustedUntil = typeof item.exhaustedUntil === "number" && Number.isFinite(item.exhaustedUntil) ? item.exhaustedUntil : 0;
+        const lastErrorCode = typeof item.lastErrorCode === "string" ? item.lastErrorCode : undefined;
+        const accountKey = typeof item.accountKey === "string" && item.accountKey.trim().length > 0 ? item.accountKey.trim() : undefined;
+        normalizedAccounts.push({
+            id,
+            token,
+            resource_url: token.resource_url,
+            exhaustedUntil,
+            lastErrorCode,
+            accountKey,
+            createdAt,
+            updatedAt,
+        });
+    }
+    let activeAccountId = typeof input.activeAccountId === "string" && input.activeAccountId.length > 0 ? input.activeAccountId : null;
+    if (activeAccountId && !normalizedAccounts.some(account => account.id === activeAccountId)) {
+        activeAccountId = null;
+    }
+    if (!activeAccountId && normalizedAccounts.length > 0) {
+        activeAccountId = normalizedAccounts[0].id;
+    }
+    return {
+        version: ACCOUNT_STORE_VERSION,
+        activeAccountId,
+        accounts: normalizedAccounts,
+    };
+}
+
+function normalizeTokenResultToStored(tokenResult) {
+    if (!tokenResult || tokenResult.type !== "success") {
+        return null;
+    }
+    return toStoredTokenData({
+        access_token: tokenResult.access,
+        refresh_token: tokenResult.refresh,
+        token_type: "Bearer",
+        expiry_date: tokenResult.expires,
+        resource_url: tokenResult.resourceUrl,
+    });
+}
+
+function parseJwtPayloadSegment(token) {
+    if (typeof token !== "string") {
+        return null;
+    }
+    const parts = token.split(".");
+    if (parts.length < 2) {
+        return null;
+    }
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+    try {
+        return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+    }
+    catch (_error) {
+        return null;
+    }
+}
+
+function deriveAccountKeyFromToken(tokenData) {
+    if (!tokenData || typeof tokenData !== "object") {
+        return null;
+    }
+    const payload = parseJwtPayloadSegment(tokenData.access_token);
+    if (payload && typeof payload === "object") {
+        const candidates = ["sub", "uid", "user_id", "email", "username"];
+        for (const key of candidates) {
+            const value = payload[key];
+            if (typeof value === "string" && value.trim().length > 0) {
+                return `${key}:${value.trim()}`;
+            }
+        }
+    }
+    if (typeof tokenData.refresh_token === "string" && tokenData.refresh_token.length > 12) {
+        return `refresh:${tokenData.refresh_token}`;
+    }
+    return null;
+}
+
+function buildAccountEntry(tokenData, accountId, accountKey) {
+    const now = Date.now();
+    return {
+        id: accountId,
+        token: tokenData,
+        resource_url: tokenData.resource_url,
+        exhaustedUntil: 0,
+        lastErrorCode: undefined,
+        accountKey: accountKey || undefined,
+        createdAt: now,
+        updatedAt: now,
+    };
+}
+
+function writeAccountsStoreData(store) {
+    const qwenDir = getQwenDir();
+    if (!existsSync(qwenDir)) {
+        mkdirSync(qwenDir, { recursive: true, mode: 0o700 });
+    }
+    const accountsPath = getAccountsPath();
+    const tempPath = `${accountsPath}.tmp.${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+    const payload = {
+        version: ACCOUNT_STORE_VERSION,
+        activeAccountId: store.activeAccountId || null,
+        accounts: store.accounts.map(account => ({
+            id: account.id,
+            token: account.token,
+            resource_url: account.resource_url,
+            exhaustedUntil: account.exhaustedUntil || 0,
+            lastErrorCode: account.lastErrorCode,
+            accountKey: account.accountKey,
+            createdAt: account.createdAt,
+            updatedAt: account.updatedAt,
+        })),
+    };
+    try {
+        writeFileSync(tempPath, JSON.stringify(payload, null, 2), {
+            encoding: "utf-8",
+            mode: 0o600,
+        });
+        renameSync(tempPath, accountsPath);
+    }
+    catch (error) {
+        try {
+            if (existsSync(tempPath)) {
+                unlinkSync(tempPath);
+            }
+        }
+        catch (_cleanupError) {
+        }
+        throw error;
+    }
+}
+
+function loadAccountsStoreData() {
+    const path = getAccountsPath();
+    if (!existsSync(path)) {
+        return normalizeAccountStore(null);
+    }
+    try {
+        const raw = JSON.parse(readFileSync(path, "utf-8"));
+        return normalizeAccountStore(raw);
+    }
+    catch (error) {
+        logWarn("Failed to read oauth_accounts.json, using empty store", error);
+        return normalizeAccountStore(null);
+    }
+}
+
+function pickNextHealthyAccount(store, excludedIds = new Set(), now = Date.now()) {
+    const accounts = Array.isArray(store.accounts) ? store.accounts : [];
+    if (accounts.length === 0) {
+        return null;
+    }
+    const activeIndex = accounts.findIndex(account => account.id === store.activeAccountId);
+    for (let step = 1; step <= accounts.length; step += 1) {
+        const index = activeIndex >= 0 ? (activeIndex + step) % accounts.length : (step - 1);
+        const candidate = accounts[index];
+        if (!candidate || excludedIds.has(candidate.id)) {
+            continue;
+        }
+        if (typeof candidate.exhaustedUntil === "number" && candidate.exhaustedUntil > now) {
+            continue;
+        }
+        return candidate;
+    }
+    return null;
+}
+
+function countHealthyAccounts(store, now = Date.now()) {
+    return store.accounts.filter(account => !(typeof account.exhaustedUntil === "number" && account.exhaustedUntil > now)).length;
+}
+
+function syncAccountToLegacyTokenFile(account) {
+    writeStoredTokenData({
+        access_token: account.token.access_token,
+        refresh_token: account.token.refresh_token,
+        token_type: account.token.token_type || "Bearer",
+        expiry_date: account.token.expiry_date,
+        resource_url: account.resource_url,
+    });
+}
+
 /**
  * Builds token success object from stored token data
  * @param {Object} stored - Stored token data from file
@@ -251,6 +474,37 @@ function migrateLegacyTokenIfNeeded() {
         logWarn("Failed to migrate legacy token:", error);
     }
 }
+
+function migrateLegacyTokenToAccountsIfNeeded() {
+    const accountsPath = getAccountsPath();
+    if (existsSync(accountsPath)) {
+        return;
+    }
+    const legacyToken = loadStoredToken();
+    if (!legacyToken) {
+        return;
+    }
+    const tokenData = toStoredTokenData(legacyToken);
+    if (!tokenData) {
+        return;
+    }
+    const accountKey = deriveAccountKeyFromToken(tokenData);
+    const accountId = `acct_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 10)}`;
+    const store = normalizeAccountStore({
+        version: ACCOUNT_STORE_VERSION,
+        activeAccountId: accountId,
+        accounts: [buildAccountEntry(tokenData, accountId, accountKey)],
+    });
+    try {
+        writeAccountsStoreData(store);
+        if (LOGGING_ENABLED) {
+            logInfo("Migrated legacy oauth_creds.json to oauth_accounts.json");
+        }
+    }
+    catch (error) {
+        logWarn("Failed to migrate legacy token to oauth_accounts.json", error);
+    }
+}
 /**
  * Acquires exclusive lock for token refresh to prevent concurrent refreshes
  * Uses file-based locking with exponential backoff retry strategy
@@ -259,6 +513,10 @@ function migrateLegacyTokenIfNeeded() {
  */
 async function acquireTokenLock() {
     const lockPath = getTokenLockPath();
+    const qwenDir = getQwenDir();
+    if (!existsSync(qwenDir)) {
+        mkdirSync(qwenDir, { recursive: true, mode: 0o700 });
+    }
     const lockValue = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     let waitMs = LOCK_ATTEMPT_INTERVAL_MS;
     for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt++) {
@@ -320,6 +578,82 @@ function releaseTokenLock(lockPath) {
         if (!hasErrorCode(error, "ENOENT")) {
             logWarn("Failed to release token lock file", error);
         }
+    }
+}
+
+async function acquireAccountsLock() {
+    const lockPath = getAccountsLockPath();
+    const qwenDir = getQwenDir();
+    if (!existsSync(qwenDir)) {
+        mkdirSync(qwenDir, { recursive: true, mode: 0o700 });
+    }
+    const lockValue = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    let waitMs = LOCK_ATTEMPT_INTERVAL_MS;
+    for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt++) {
+        try {
+            writeFileSync(lockPath, lockValue, {
+                encoding: "utf-8",
+                flag: "wx",
+                mode: 0o600,
+            });
+            return lockPath;
+        }
+        catch (error) {
+            if (!hasErrorCode(error, "EEXIST")) {
+                throw error;
+            }
+            try {
+                const stats = statSync(lockPath);
+                const ageMs = Date.now() - stats.mtimeMs;
+                if (ageMs > LOCK_TIMEOUT_MS) {
+                    try {
+                        unlinkSync(lockPath);
+                    }
+                    catch (staleError) {
+                        if (!hasErrorCode(staleError, "ENOENT")) {
+                            logWarn("Failed to remove stale accounts lock", staleError);
+                        }
+                    }
+                    continue;
+                }
+            }
+            catch (statError) {
+                if (!hasErrorCode(statError, "ENOENT")) {
+                    logWarn("Failed to inspect accounts lock file", statError);
+                }
+            }
+            await sleep(waitMs);
+            waitMs = Math.min(Math.floor(waitMs * LOCK_BACKOFF_MULTIPLIER), LOCK_MAX_INTERVAL_MS);
+        }
+    }
+    throw new Error("Accounts lock timeout");
+}
+
+function releaseAccountsLock(lockPath) {
+    try {
+        unlinkSync(lockPath);
+    }
+    catch (error) {
+        if (!hasErrorCode(error, "ENOENT")) {
+            logWarn("Failed to release accounts lock file", error);
+        }
+    }
+}
+
+async function withAccountsStoreLock(mutator) {
+    const lockPath = await acquireAccountsLock();
+    try {
+        const store = loadAccountsStoreData();
+        const next = await mutator(store);
+        if (next && typeof next === "object") {
+            writeAccountsStoreData(next);
+            return next;
+        }
+        writeAccountsStoreData(store);
+        return store;
+    }
+    finally {
+        releaseAccountsLock(lockPath);
     }
 }
 /**
@@ -694,6 +1028,217 @@ export function saveToken(tokenResult) {
         throw error;
     }
 }
+
+function buildRuntimeAccountResponse(account, healthyCount, totalCount, accessToken, resourceUrl) {
+    return {
+        accountId: account.id,
+        accessToken,
+        resourceUrl: resourceUrl || account.resource_url,
+        exhaustedUntil: account.exhaustedUntil || 0,
+        healthyAccountCount: healthyCount,
+        totalAccountCount: totalCount,
+    };
+}
+
+export async function upsertOAuthAccount(tokenResult, options = {}) {
+    const tokenData = normalizeTokenResultToStored(tokenResult);
+    if (!tokenData) {
+        return null;
+    }
+    migrateLegacyTokenToAccountsIfNeeded();
+    const accountKey = options.accountKey || deriveAccountKeyFromToken(tokenData);
+    let selectedId = null;
+    await withAccountsStoreLock((store) => {
+        const now = Date.now();
+        let index = -1;
+        if (typeof options.accountId === "string" && options.accountId.length > 0) {
+            index = store.accounts.findIndex(account => account.id === options.accountId);
+        }
+        if (index < 0 && accountKey) {
+            index = store.accounts.findIndex(account => account.accountKey === accountKey);
+        }
+        if (index < 0) {
+            index = store.accounts.findIndex(account => account.token?.refresh_token === tokenData.refresh_token);
+        }
+        if (index < 0) {
+            const newId = typeof options.accountId === "string" && options.accountId.length > 0
+                ? options.accountId
+                : `acct_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 10)}`;
+            store.accounts.push(buildAccountEntry(tokenData, newId, accountKey));
+            index = store.accounts.length - 1;
+        }
+        const target = store.accounts[index];
+        target.token = tokenData;
+        target.resource_url = tokenData.resource_url;
+        target.exhaustedUntil = 0;
+        target.lastErrorCode = undefined;
+        target.updatedAt = now;
+        if (!target.createdAt || !Number.isFinite(target.createdAt)) {
+            target.createdAt = now;
+        }
+        if (accountKey) {
+            target.accountKey = accountKey;
+        }
+        selectedId = target.id;
+        if (options.setActive || !store.activeAccountId) {
+            store.activeAccountId = target.id;
+        }
+        return store;
+    });
+    if (!selectedId) {
+        return null;
+    }
+    if (options.setActive) {
+        return getActiveOAuthAccount({ allowExhausted: true, preferredAccountId: selectedId });
+    }
+    return getActiveOAuthAccount({ allowExhausted: true });
+}
+
+export async function getActiveOAuthAccount(options = {}) {
+    migrateLegacyTokenToAccountsIfNeeded();
+    const lockPath = await acquireAccountsLock();
+    let selected = null;
+    let dirty = false;
+    try {
+        const store = loadAccountsStoreData();
+        const now = Date.now();
+        if (store.accounts.length === 0) {
+            return null;
+        }
+        if (typeof options.preferredAccountId === "string" && options.preferredAccountId.length > 0) {
+            const exists = store.accounts.some(account => account.id === options.preferredAccountId);
+            if (exists && store.activeAccountId !== options.preferredAccountId) {
+                store.activeAccountId = options.preferredAccountId;
+                dirty = true;
+            }
+        }
+        let active = store.accounts.find(account => account.id === store.activeAccountId);
+        if (!active) {
+            active = store.accounts[0];
+            store.activeAccountId = active.id;
+            dirty = true;
+        }
+        const activeHealthy = !(typeof active.exhaustedUntil === "number" && active.exhaustedUntil > now);
+        if (!activeHealthy && !options.allowExhausted) {
+            const replacement = pickNextHealthyAccount(store, new Set(), now);
+            if (!replacement) {
+                return null;
+            }
+            if (store.activeAccountId !== replacement.id) {
+                store.activeAccountId = replacement.id;
+                dirty = true;
+            }
+            active = replacement;
+        }
+        const healthyCount = countHealthyAccounts(store, now);
+        selected = {
+            account: { ...active },
+            healthyCount,
+            totalCount: store.accounts.length,
+        };
+        if (dirty) {
+            writeAccountsStoreData(store);
+        }
+    }
+    finally {
+        releaseAccountsLock(lockPath);
+    }
+    if (!selected) {
+        return null;
+    }
+    if (options.requireHealthy && selected.account.exhaustedUntil > Date.now()) {
+        return null;
+    }
+    try {
+        syncAccountToLegacyTokenFile(selected.account);
+    }
+    catch (error) {
+        logWarn("Failed to sync active account token to oauth_creds.json", error);
+        return null;
+    }
+    const valid = await getValidToken();
+    if (!valid) {
+        return null;
+    }
+    const latest = loadStoredToken();
+    if (latest) {
+        try {
+            await withAccountsStoreLock((store) => {
+                const target = store.accounts.find(account => account.id === selected.account.id);
+                if (!target) {
+                    return store;
+                }
+                target.token = latest;
+                target.resource_url = latest.resource_url;
+                target.updatedAt = Date.now();
+                return store;
+            });
+        }
+        catch (error) {
+            logWarn("Failed to update account token from refreshed legacy token", error);
+        }
+    }
+    return buildRuntimeAccountResponse(selected.account, selected.healthyCount, selected.totalCount, valid.accessToken, valid.resourceUrl);
+}
+
+export async function markOAuthAccountQuotaExhausted(accountId, errorCode = "insufficient_quota") {
+    if (typeof accountId !== "string" || accountId.length === 0) {
+        return null;
+    }
+    migrateLegacyTokenToAccountsIfNeeded();
+    const cooldownMs = getQuotaCooldownMs();
+    let outcome = null;
+    await withAccountsStoreLock((store) => {
+        const now = Date.now();
+        const target = store.accounts.find(account => account.id === accountId);
+        if (!target) {
+            return store;
+        }
+        target.exhaustedUntil = now + cooldownMs;
+        target.lastErrorCode = errorCode;
+        target.updatedAt = now;
+        if (store.activeAccountId === target.id) {
+            const next = pickNextHealthyAccount(store, new Set([target.id]), now);
+            if (next) {
+                store.activeAccountId = next.id;
+            }
+        }
+        outcome = {
+            accountId: target.id,
+            exhaustedUntil: target.exhaustedUntil,
+            healthyAccountCount: countHealthyAccounts(store, now),
+            totalAccountCount: store.accounts.length,
+        };
+        return store;
+    });
+    return outcome;
+}
+
+export async function switchToNextHealthyOAuthAccount(excludedAccountIds = []) {
+    migrateLegacyTokenToAccountsIfNeeded();
+    const excluded = new Set(Array.isArray(excludedAccountIds)
+        ? excludedAccountIds.filter(id => typeof id === "string" && id.length > 0)
+        : []);
+    let switchedId = null;
+    await withAccountsStoreLock((store) => {
+        const next = pickNextHealthyAccount(store, excluded, Date.now());
+        if (!next) {
+            return store;
+        }
+        store.activeAccountId = next.id;
+        switchedId = next.id;
+        return store;
+    });
+    if (!switchedId) {
+        return null;
+    }
+    return getActiveOAuthAccount({
+        allowExhausted: false,
+        requireHealthy: true,
+        preferredAccountId: switchedId,
+    });
+}
+
 /**
  * Checks if token is expired (with buffer)
  * @param {number} expiresAt - Token expiry timestamp in milliseconds
