@@ -11,7 +11,7 @@
  * 
  * @license MIT with Usage Disclaimer (see LICENSE file)
  * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
- * @version 2.3.7
+ * @version 2.3.8
  */
 
 import { randomUUID } from "node:crypto";
@@ -40,7 +40,7 @@ const CLI_FALLBACK_MAX_BUFFER_CHARS = 1024 * 1024;
 /** Enable CLI fallback feature via environment variable */
 const ENABLE_CLI_FALLBACK = process.env.OPENCODE_QWEN_ENABLE_CLI_FALLBACK === "1";
 /** User agent string for plugin identification */
-const PLUGIN_USER_AGENT = "opencode-qwen-cli-auth/2.3.4";
+const PLUGIN_USER_AGENT = "opencode-qwen-cli-auth/2.3.8";
 /** Output token limits per model for DashScope OAuth */
 const DASH_SCOPE_OUTPUT_LIMITS = {
     "coder-model": 65536,
@@ -103,6 +103,11 @@ const CLIENT_ONLY_BODY_FIELDS = new Set([
     "metadata",
     "options",
     "debug",
+]);
+const REASONING_CONTROL_FIELDS = new Set([
+    "reasoning",
+    "reasoningEffort",
+    "reasoning_effort",
 ]);
 function resolveQwenCliCommand() {
     const fromEnv = process.env.QWEN_CLI_PATH;
@@ -393,6 +398,12 @@ function sanitizeOutgoingPayload(payload) {
     if ("stream_options" in sanitized && sanitized.stream !== true) {
         delete sanitized.stream_options;
         changed = true;
+    }
+    for (const field of REASONING_CONTROL_FIELDS) {
+        if (field in sanitized) {
+            delete sanitized[field];
+            changed = true;
+        }
     }
     // Cap max_tokens fields
     if (typeof sanitized.max_tokens === "number" && sanitized.max_tokens > CHAT_MAX_TOKENS_CAP) {
@@ -1184,7 +1195,10 @@ async function getValidAccessToken(getAuth) {
                 accessToken = refreshResult.access;
                 resourceUrl = refreshResult.resourceUrl;
                 saveToken(refreshResult);
-                await upsertOAuthAccount(refreshResult, { setActive: false });
+                await upsertOAuthAccount(refreshResult, {
+                    setActive: false,
+                    accountId: activeOAuthAccount?.accountId,
+                });
             }
             else {
                 if (LOGGING_ENABLED) {
@@ -1210,7 +1224,10 @@ async function getValidAccessToken(getAuth) {
                 resourceUrl,
             };
             saveToken(sdkToken);
-            await upsertOAuthAccount(sdkToken, { setActive: false });
+            await upsertOAuthAccount(sdkToken, {
+                setActive: false,
+                accountId: activeOAuthAccount?.accountId,
+            });
         }
         catch (e) {
             logWarn("Failed to bootstrap .qwen token from SDK auth state:", e);
@@ -1401,13 +1418,16 @@ export const QwenAuthPlugin = async (_input) => {
                     "coder-model": {
                         id: "coder-model",
                         name: "Qwen 3.5 Plus",
-                        // Qwen does not support reasoning_effort from OpenCode UI
-                        // Thinking is always enabled by default on server side (qwen3.5-plus)
                         attachment: false,
-                        reasoning: false,
+                        reasoning: true,
                         limit: { context: 1048576, output: CHAT_MAX_TOKENS_CAP },
                         cost: { input: 0, output: 0 },
                         modalities: { input: ["text"], output: ["text"] },
+                        variants: {
+                            low: { disabled: true },
+                            medium: { disabled: true },
+                            high: { disabled: true },
+                        },
                     },
                     "vision-model": {
                         id: "vision-model",

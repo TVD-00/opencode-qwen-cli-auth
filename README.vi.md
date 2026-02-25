@@ -10,6 +10,8 @@ Plugin OAuth cho [OpenCode](https://opencode.ai) để sử dụng Qwen miễn p
 - **Hỗ trợ đa tài khoản** - thêm nhiều Qwen account và duy trì một tài khoản active
 - **Tương thích DashScope** - tự động inject headers cần thiết cho OAuth flow
 - **Giới hạn output token thông minh** - tự động cap theo model (65K cho coder-model, 8K cho vision-model)
+- **Hiển thị reasoning trên UI (coder-model)** - tooltip model trong OpenCode sẽ hiện hỗ trợ reasoning
+- **An toàn reasoning-effort** - loại bỏ các trường điều khiển reasoning khỏi payload để giữ tương thích OAuth
 - **Retry & Fallback** - xử lý lỗi quota/rate limit với cơ chế degrade (giảm tải payload)
 - **Logging & Debugging** - hỗ trợ debug chi tiết qua biến môi trường
 
@@ -54,6 +56,12 @@ Plugin sẽ lưu từng lần đăng nhập thành công vào kho đa tài kho�
 |-------|-----|-------|--------|---------|------------|---------|
 | Qwen Coder (Qwen 3.5 Plus) | `coder-model` | text | text | 1M tokens | 65,536 tokens | Miễn phí |
 | Qwen VL Plus (Vision) | `vision-model` | text, image | text | 128K tokens | 8,192 tokens | Miễn phí |
+
+### Ghi chú reasoning
+
+- `coder-model` được đánh dấu có reasoning trong UI của OpenCode.
+- Bản phát hành này chỉ hỗ trợ reasoning ở mức hiển thị UI, chưa bật điều khiển reasoning-effort ở runtime cho Qwen OAuth.
+- Nếu client gửi `reasoning`, `reasoningEffort` hoặc `reasoning_effort`, plugin sẽ tự loại bỏ trước khi gửi request đi.
 
 ## Cấu hình
 
@@ -131,7 +139,8 @@ Khi gặp lỗi `429 insufficient_quota`, plugin sẽ tự động:
 
 - Tự động sử dụng refresh token để lấy token mới
 - Thử lại tối đa 2 lần đối với các lỗi tạm thời (timeout, lỗi mạng)
-- Xóa token cũ và yêu cầu đăng nhập lại nếu nhận lỗi 401/403
+- Nếu refresh gặp `401/403`, plugin đánh dấu account hiện tại là `auth_invalid` và tự chuyển sang account khỏe tiếp theo nếu có
+- Nếu không còn account khỏe, plugin sẽ yêu cầu đăng nhập lại (`opencode auth login`)
 
 ## Quản lý xác thực
 

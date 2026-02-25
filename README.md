@@ -10,6 +10,8 @@ OAuth plugin for [OpenCode](https://opencode.ai) to use Qwen for free via Qwen A
 - **Multi-account support** - add multiple Qwen accounts and keep one active account
 - **DashScope compatibility** - automatically injects required headers for the OAuth flow
 - **Smart output token limit** - auto-caps tokens based on model (65K for coder-model, 8K for vision-model)
+- **Reasoning capability in UI (coder-model)** - model tooltip shows reasoning support in OpenCode
+- **Reasoning-effort safety** - strips reasoning control fields from outbound payload for OAuth compatibility
 - **Retry & Fallback** - handles quota/rate limit errors with payload degradation mechanism
 - **Logging & Debugging** - detailed debugging support via environment variables
 
@@ -54,6 +56,12 @@ The plugin stores each successful login in the multi-account store and can auto-
 |-------|-----|-------|--------|---------|------------|---------|
 | Qwen Coder (Qwen 3.5 Plus) | `coder-model` | text | text | 1M tokens | 65,536 tokens | Free |
 | Qwen VL Plus (Vision) | `vision-model` | text, image | text | 128K tokens | 8,192 tokens | Free |
+
+### Reasoning Note
+
+- `coder-model` is marked as reasoning-capable in OpenCode UI.
+- This release is UI-only for reasoning and does not enable runtime reasoning-effort controls for Qwen OAuth.
+- If clients send `reasoning`, `reasoningEffort`, or `reasoning_effort`, the plugin removes these fields before forwarding requests.
 
 ## Configuration
 
@@ -131,7 +139,8 @@ When hitting a `429 insufficient_quota` error, the plugin automatically:
 
 - Automatically uses refresh token
 - Retries up to 2 times for transient errors (timeout, network)
-- Clears token and requests re-auth on 401/403
+- On refresh `401/403`, marks current account as `auth_invalid` and switches to next healthy account when available
+- If no healthy account is available, requests re-authentication (`opencode auth login`)
 
 ## Authentication Management
 

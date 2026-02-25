@@ -7,6 +7,7 @@
 
 import { generatePKCE } from "@openauthjs/openauth/pkce";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, renameSync, statSync } from "fs";
+import { dirname } from "path";
 import { QWEN_OAUTH, DEFAULT_QWEN_BASE_URL, TOKEN_REFRESH_BUFFER_MS, VERIFICATION_URI } from "../constants.js";
 import { getTokenPath, getQwenDir, getTokenLockPath, getLegacyTokenPath, getAccountsPath, getAccountsLockPath } from "../config.js";
 import { logError, logWarn, logInfo, LOGGING_ENABLED } from "../logger.js";
@@ -307,11 +308,15 @@ function buildAccountEntry(tokenData, accountId, accountKey) {
 }
 
 function writeAccountsStoreData(store) {
+    const accountsPath = getAccountsPath();
+    const accountsDir = dirname(accountsPath);
     const qwenDir = getQwenDir();
     if (!existsSync(qwenDir)) {
         mkdirSync(qwenDir, { recursive: true, mode: 0o700 });
     }
-    const accountsPath = getAccountsPath();
+    if (!existsSync(accountsDir)) {
+        mkdirSync(accountsDir, { recursive: true, mode: 0o700 });
+    }
     const tempPath = `${accountsPath}.tmp.${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
     const payload = {
         version: ACCOUNT_STORE_VERSION,
@@ -583,9 +588,9 @@ function releaseTokenLock(lockPath) {
 
 async function acquireAccountsLock() {
     const lockPath = getAccountsLockPath();
-    const qwenDir = getQwenDir();
-    if (!existsSync(qwenDir)) {
-        mkdirSync(qwenDir, { recursive: true, mode: 0o700 });
+    const lockDir = dirname(lockPath);
+    if (!existsSync(lockDir)) {
+        mkdirSync(lockDir, { recursive: true, mode: 0o700 });
     }
     const lockValue = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     let waitMs = LOCK_ATTEMPT_INTERVAL_MS;
@@ -1096,89 +1101,140 @@ export async function upsertOAuthAccount(tokenResult, options = {}) {
 
 export async function getActiveOAuthAccount(options = {}) {
     migrateLegacyTokenToAccountsIfNeeded();
-    const lockPath = await acquireAccountsLock();
-    let selected = null;
-    let dirty = false;
-    try {
-        const store = loadAccountsStoreData();
-        const now = Date.now();
-        if (store.accounts.length === 0) {
-            return null;
-        }
-        if (typeof options.preferredAccountId === "string" && options.preferredAccountId.length > 0) {
-            const exists = store.accounts.some(account => account.id === options.preferredAccountId);
-            if (exists && store.activeAccountId !== options.preferredAccountId) {
-                store.activeAccountId = options.preferredAccountId;
-                dirty = true;
-            }
-        }
-        let active = store.accounts.find(account => account.id === store.activeAccountId);
-        if (!active) {
-            active = store.accounts[0];
-            store.activeAccountId = active.id;
-            dirty = true;
-        }
-        const activeHealthy = !(typeof active.exhaustedUntil === "number" && active.exhaustedUntil > now);
-        if (!activeHealthy && !options.allowExhausted) {
-            const replacement = pickNextHealthyAccount(store, new Set(), now);
-            if (!replacement) {
+    const preferredAccountId = typeof options.preferredAccountId === "string" && options.preferredAccountId.length > 0
+        ? options.preferredAccountId
+        : null;
+    const attemptedAuthRejected = new Set();
+    for (;;) {
+        const lockPath = await acquireAccountsLock();
+        let selected = null;
+        let dirty = false;
+        try {
+            const store = loadAccountsStoreData();
+            const now = Date.now();
+            if (store.accounts.length === 0) {
                 return null;
             }
-            if (store.activeAccountId !== replacement.id) {
-                store.activeAccountId = replacement.id;
+            if (attemptedAuthRejected.size === 0 && preferredAccountId) {
+                const exists = store.accounts.some(account => account.id === preferredAccountId);
+                if (exists && store.activeAccountId !== preferredAccountId) {
+                    store.activeAccountId = preferredAccountId;
+                    dirty = true;
+                }
+            }
+            let active = store.accounts.find(account => account.id === store.activeAccountId);
+            if (!active) {
+                active = store.accounts[0];
+                store.activeAccountId = active.id;
                 dirty = true;
             }
-            active = replacement;
+            const activeHealthy = !(typeof active.exhaustedUntil === "number" && active.exhaustedUntil > now);
+            if (!activeHealthy && !options.allowExhausted) {
+                const replacement = pickNextHealthyAccount(store, new Set(), now);
+                if (!replacement) {
+                    return null;
+                }
+                if (store.activeAccountId !== replacement.id) {
+                    store.activeAccountId = replacement.id;
+                    dirty = true;
+                }
+                active = replacement;
+            }
+            const healthyCount = countHealthyAccounts(store, now);
+            selected = {
+                account: { ...active },
+                healthyCount,
+                totalCount: store.accounts.length,
+            };
+            if (dirty) {
+                writeAccountsStoreData(store);
+            }
         }
-        const healthyCount = countHealthyAccounts(store, now);
-        selected = {
-            account: { ...active },
-            healthyCount,
-            totalCount: store.accounts.length,
-        };
-        if (dirty) {
-            writeAccountsStoreData(store);
+        finally {
+            releaseAccountsLock(lockPath);
         }
-    }
-    finally {
-        releaseAccountsLock(lockPath);
-    }
-    if (!selected) {
-        return null;
-    }
-    if (options.requireHealthy && selected.account.exhaustedUntil > Date.now()) {
-        return null;
-    }
-    try {
-        syncAccountToLegacyTokenFile(selected.account);
-    }
-    catch (error) {
-        logWarn("Failed to sync active account token to oauth_creds.json", error);
-        return null;
-    }
-    const valid = await getValidToken();
-    if (!valid) {
-        return null;
-    }
-    const latest = loadStoredToken();
-    if (latest) {
+        if (!selected) {
+            return null;
+        }
+        if (options.requireHealthy && selected.account.exhaustedUntil > Date.now()) {
+            return null;
+        }
+        try {
+            syncAccountToLegacyTokenFile(selected.account);
+        }
+        catch (error) {
+            logWarn("Failed to sync active account token to oauth_creds.json", error);
+            return null;
+        }
+        const valid = await getValidTokenDetailed({ clearOnFailure: false });
+        if (valid.type === "success") {
+            const latest = loadStoredToken();
+            if (latest) {
+                try {
+                    await withAccountsStoreLock((store) => {
+                        const target = store.accounts.find(account => account.id === selected.account.id);
+                        if (!target) {
+                            return store;
+                        }
+                        target.token = latest;
+                        target.resource_url = latest.resource_url;
+                        target.updatedAt = Date.now();
+                        return store;
+                    });
+                }
+                catch (error) {
+                    logWarn("Failed to update account token from refreshed legacy token", error);
+                }
+            }
+            return buildRuntimeAccountResponse(selected.account, selected.healthyCount, selected.totalCount, valid.accessToken, valid.resourceUrl);
+        }
+        if (valid.type !== "auth_rejected") {
+            return null;
+        }
+        attemptedAuthRejected.add(selected.account.id);
+        if (attemptedAuthRejected.size >= selected.totalCount) {
+            if (LOGGING_ENABLED) {
+                logWarn("All OAuth accounts rejected with auth_invalid, re-authentication required", {
+                    attempted: attemptedAuthRejected.size,
+                    total: selected.totalCount,
+                });
+            }
+            return null;
+        }
+        let switchedToHealthy = false;
         try {
             await withAccountsStoreLock((store) => {
+                const now = Date.now();
                 const target = store.accounts.find(account => account.id === selected.account.id);
                 if (!target) {
                     return store;
                 }
-                target.token = latest;
-                target.resource_url = latest.resource_url;
-                target.updatedAt = Date.now();
+                target.exhaustedUntil = now + getQuotaCooldownMs();
+                target.lastErrorCode = "auth_invalid";
+                target.updatedAt = now;
+                const next = pickNextHealthyAccount(store, attemptedAuthRejected, now);
+                if (next) {
+                    store.activeAccountId = next.id;
+                    switchedToHealthy = true;
+                }
                 return store;
             });
         }
         catch (error) {
-            logWarn("Failed to update account token from refreshed legacy token", error);
+            logWarn("Failed to switch OAuth account after auth_invalid", error);
+            return null;
+        }
+        if (!switchedToHealthy) {
+            if (LOGGING_ENABLED) {
+                logWarn("No healthy OAuth account available after auth_invalid", {
+                    accountID: selected.account.id,
+                    attempted: attemptedAuthRejected.size,
+                    total: selected.totalCount,
+                });
+            }
+            return null;
         }
     }
-    return buildRuntimeAccountResponse(selected.account, selected.healthyCount, selected.totalCount, valid.accessToken, valid.resourceUrl);
 }
 
 export async function markOAuthAccountQuotaExhausted(accountId, errorCode = "insufficient_quota") {
@@ -1248,18 +1304,15 @@ export function isTokenExpired(expiresAt) {
     return Date.now() >= expiresAt - TOKEN_REFRESH_BUFFER_MS;
 }
 
-/**
- * Gets valid access token, refreshing if expired
- * @returns {Promise<{ accessToken: string, resourceUrl?: string }|null>} Valid token or null if unavailable
- */
-export async function getValidToken() {
+async function getValidTokenDetailed(options = {}) {
+    const clearOnFailure = options.clearOnFailure === true;
     const stored = loadStoredToken();
     if (!stored) {
-        return null;
+        return { type: "missing" };
     }
-    // Return cached token if still valid
     if (!isTokenExpired(stored.expiry_date)) {
         return {
+            type: "success",
             accessToken: stored.access_token,
             resourceUrl: stored.resource_url,
         };
@@ -1267,16 +1320,48 @@ export async function getValidToken() {
     if (LOGGING_ENABLED) {
         logInfo("Token expired, refreshing...");
     }
-    // Token expired, try to refresh
     const refreshResult = await refreshAccessToken(stored.refresh_token);
-    if (refreshResult.type !== "success") {
-        logError("Token refresh failed, re-authentication required");
+    if (refreshResult.type === "success") {
+        return {
+            type: "success",
+            accessToken: refreshResult.access,
+            resourceUrl: refreshResult.resourceUrl,
+        };
+    }
+    const status = typeof refreshResult.status === "number" ? refreshResult.status : undefined;
+    const isAuthRejected = status === 401 ||
+        status === 403 ||
+        refreshResult.error === "refresh_token_rejected";
+    if (clearOnFailure) {
         clearStoredToken();
+    }
+    if (isAuthRejected) {
+        return {
+            type: "auth_rejected",
+            status,
+            error: refreshResult.error || "refresh_token_rejected",
+        };
+    }
+    return {
+        type: "transient_or_unknown",
+        status,
+        error: refreshResult.error || "refresh_failed",
+    };
+}
+
+/**
+ * Gets valid access token, refreshing if expired
+ * @returns {Promise<{ accessToken: string, resourceUrl?: string }|null>} Valid token or null if unavailable
+ */
+export async function getValidToken() {
+    const result = await getValidTokenDetailed({ clearOnFailure: true });
+    if (result.type !== "success") {
+        logError("Token refresh failed, re-authentication required");
         return null;
     }
     return {
-        accessToken: refreshResult.access,
-        resourceUrl: refreshResult.resourceUrl,
+        accessToken: result.accessToken,
+        resourceUrl: result.resourceUrl,
     };
 }
 
