@@ -1,33 +1,47 @@
 /**
- * Alibaba Qwen OAuth Authentication Plugin for opencode
- *
- * Simple plugin: handles OAuth login + provides apiKey/baseURL to SDK.
- * SDK handles streaming, headers, and request format.
- *
+ * @fileoverview Alibaba Qwen OAuth Authentication Plugin for opencode
+ * Main plugin entry point implementing OAuth 2.0 Device Authorization Grant
+ * Handles authentication, request transformation, and error recovery
+ * 
+ * Architecture:
+ * - OAuth flow: PKCE + Device Code Grant (RFC 8628)
+ * - Token management: Automatic refresh with file-based storage
+ * - Request handling: Custom fetch wrapper with retry logic
+ * - Error recovery: Quota degradation and CLI fallback
+ * 
  * @license MIT with Usage Disclaimer (see LICENSE file)
  * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
+ * @version 2.2.9
  */
+
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createPKCE, requestDeviceCode, pollForToken, getApiBaseUrl, saveToken, refreshAccessToken, loadStoredToken, getValidToken } from "./lib/auth/auth.js";
 import { PROVIDER_ID, AUTH_LABELS, DEVICE_FLOW, PORTAL_HEADERS } from "./lib/constants.js";
 import { logError, logInfo, logWarn, LOGGING_ENABLED } from "./lib/logger.js";
+
+/** Request timeout for chat completions in milliseconds */
 const CHAT_REQUEST_TIMEOUT_MS = 30000;
-const CHAT_MAX_RETRIES = 0;
-// Output token caps should match what qwen-code uses for DashScope.
-// - coder-model: 64K output
-// - vision-model: 8K output
-// We still keep a default for safety.
+/** Maximum number of retry attempts for failed requests */
+const CHAT_MAX_RETRIES = 3;
+/** Output token cap for coder-model (64K tokens) */
 const CHAT_MAX_TOKENS_CAP = 65536;
+/** Default max tokens for chat requests */
 const CHAT_DEFAULT_MAX_TOKENS = 2048;
+/** Maximum consecutive polling failures before aborting OAuth flow */
 const MAX_CONSECUTIVE_POLL_FAILURES = 3;
+/** Reduced max tokens for quota degraded requests */
 const QUOTA_DEGRADE_MAX_TOKENS = 1024;
+/** Timeout for CLI fallback execution in milliseconds */
 const CLI_FALLBACK_TIMEOUT_MS = 8000;
+/** Maximum buffer size for CLI output in characters */
 const CLI_FALLBACK_MAX_BUFFER_CHARS = 1024 * 1024;
+/** Enable CLI fallback feature via environment variable */
 const ENABLE_CLI_FALLBACK = process.env.OPENCODE_QWEN_ENABLE_CLI_FALLBACK === "1";
+/** User agent string for plugin identification */
 const PLUGIN_USER_AGENT = "opencode-qwen-cli-auth/2.2.1";
-// Match qwen-code output limits for DashScope OAuth.
+/** Output token limits per model for DashScope OAuth */
 const DASH_SCOPE_OUTPUT_LIMITS = {
     "coder-model": 65536,
     "vision-model": 8192,
@@ -127,6 +141,14 @@ function makeFailFastErrorResponse(status, code, message) {
         headers: { "content-type": "application/json" },
     });
 }
+
+/**
+ * Creates AbortSignal with timeout that composes with source signal
+ * Properly cleans up timers and event listeners
+ * @param {AbortSignal} [sourceSignal] - Original abort signal from caller
+ * @param {number} timeoutMs - Timeout in milliseconds
+ * @returns {{ signal: AbortSignal, cleanup: () => void }} Composed signal and cleanup function
+ */
 function createRequestSignalWithTimeout(sourceSignal, timeoutMs) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(new Error("request_timeout")), timeoutMs);
@@ -149,6 +171,13 @@ function createRequestSignalWithTimeout(sourceSignal, timeoutMs) {
         },
     };
 }
+
+/**
+ * Appends text chunk with size limit to prevent memory overflow
+ * @param {string} current - Current text buffer
+ * @param {string} chunk - New chunk to append
+ * @returns {string} Combined text with size limit
+ */
 function appendLimitedText(current, chunk) {
     const next = current + chunk;
     if (next.length <= CLI_FALLBACK_MAX_BUFFER_CHARS) {
@@ -156,9 +185,22 @@ function appendLimitedText(current, chunk) {
     }
     return next.slice(next.length - CLI_FALLBACK_MAX_BUFFER_CHARS);
 }
+
+/**
+ * Checks if value is a Request instance
+ * @param {*} value - Value to check
+ * @returns {boolean} True if value is a Request instance
+ */
 function isRequestInstance(value) {
     return typeof Request !== "undefined" && value instanceof Request;
 }
+
+/**
+ * Normalizes fetch invocation from Request object or URL string
+ * @param {Request|string} input - Fetch input
+ * @param {RequestInit} [init] - Fetch options
+ * @returns {{ requestInput: *, requestInit: RequestInit }} Normalized fetch parameters
+ */
 async function normalizeFetchInvocation(input, init) {
     const requestInit = init ? { ...init } : {};
     let requestInput = input;
@@ -184,6 +226,13 @@ async function normalizeFetchInvocation(input, init) {
     }
     return { requestInput, requestInit };
 }
+
+/**
+ * Gets header value from Headers object, array, or plain object
+ * @param {Headers|Array|Object} headers - Headers to search
+ * @param {string} headerName - Header name (case-insensitive)
+ * @returns {string|undefined} Header value or undefined
+ */
 function getHeaderValue(headers, headerName) {
     if (!headers) {
         return undefined;
@@ -203,6 +252,11 @@ function getHeaderValue(headers, headerName) {
     }
     return undefined;
 }
+/**
+ * Applies JSON request body with proper content-type header
+ * @param {RequestInit} requestInit - Fetch options
+ * @param {Object} payload - Request payload
+ */
 function applyJsonRequestBody(requestInit, payload) {
     requestInit.body = JSON.stringify(payload);
     if (!requestInit.headers) {
@@ -233,6 +287,12 @@ function applyJsonRequestBody(requestInit, payload) {
         requestInit.headers["content-type"] = "application/json";
     }
 }
+
+/**
+ * Parses JSON request body if content-type is application/json
+ * @param {RequestInit} requestInit - Fetch options
+ * @returns {Object|null} Parsed payload or null
+ */
 function parseJsonRequestBody(requestInit) {
     if (typeof requestInit.body !== "string") {
         return null;
@@ -252,19 +312,31 @@ function parseJsonRequestBody(requestInit) {
         return null;
     }
 }
+    catch (_error) {
+        return null;
+    }
+}
+/**
+ * Removes client-only fields and caps max_tokens
+ * @param {Object} payload - Request payload
+ * @returns {Object} Sanitized payload
+ */
 function sanitizeOutgoingPayload(payload) {
     const sanitized = { ...payload };
     let changed = false;
+    // Remove client-only fields
     for (const field of CLIENT_ONLY_BODY_FIELDS) {
         if (field in sanitized) {
             delete sanitized[field];
             changed = true;
         }
     }
+    // Remove stream_options if stream is not enabled
     if ("stream_options" in sanitized && sanitized.stream !== true) {
         delete sanitized.stream_options;
         changed = true;
     }
+    // Cap max_tokens fields
     if (typeof sanitized.max_tokens === "number" && sanitized.max_tokens > CHAT_MAX_TOKENS_CAP) {
         sanitized.max_tokens = CHAT_MAX_TOKENS_CAP;
         changed = true;
@@ -275,9 +347,17 @@ function sanitizeOutgoingPayload(payload) {
     }
     return changed ? sanitized : payload;
 }
+
+/**
+ * Creates degraded payload for quota error recovery
+ * Removes tools and reduces max_tokens to 1024
+ * @param {Object} payload - Original payload
+ * @returns {Object|null} Degraded payload or null if no changes needed
+ */
 function createQuotaDegradedPayload(payload) {
     const degraded = { ...payload };
     let changed = false;
+    // Remove tool-related fields
     if ("tools" in degraded) {
         delete degraded.tools;
         changed = true;
@@ -290,10 +370,12 @@ function createQuotaDegradedPayload(payload) {
         delete degraded.parallel_tool_calls;
         changed = true;
     }
+    // Disable streaming
     if (degraded.stream !== false) {
         degraded.stream = false;
         changed = true;
     }
+    // Reduce max_tokens
     if (typeof degraded.max_tokens !== "number" || degraded.max_tokens > QUOTA_DEGRADE_MAX_TOKENS) {
         degraded.max_tokens = QUOTA_DEGRADE_MAX_TOKENS;
         changed = true;
@@ -304,6 +386,12 @@ function createQuotaDegradedPayload(payload) {
     }
     return changed ? degraded : null;
 }
+
+/**
+ * Checks if response text contains insufficientQuota error
+ * @param {string} text - Response body text
+ * @returns {boolean} True if insufficient quota error
+ */
 function isInsufficientQuota(text) {
     if (!text) {
         return false;
@@ -317,6 +405,12 @@ function isInsufficientQuota(text) {
         return text.toLowerCase().includes("insufficient_quota");
     }
 }
+
+/**
+ * Extracts text content from message (handles string or array format)
+ * @param {string|Array} content - Message content
+ * @returns {string} Extracted text
+ */
 function extractMessageText(content) {
     if (typeof content === "string") {
         return content.trim();
@@ -334,6 +428,11 @@ function extractMessageText(content) {
         return "";
     }).filter(Boolean).join("\n").trim();
 }
+/**
+ * Builds prompt text from chat messages for CLI fallback
+ * @param {Object} payload - Request payload with messages
+ * @returns {string} Prompt text for qwen CLI
+ */
 function buildQwenCliPrompt(payload) {
     const messages = Array.isArray(payload?.messages) ? payload.messages : [];
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -356,6 +455,12 @@ function buildQwenCliPrompt(payload) {
     }).filter(Boolean).join("\n\n");
     return merged || "Please respond to the latest user request.";
 }
+
+/**
+ * Parses qwen CLI JSON output events
+ * @param {string} rawOutput - Raw CLI output
+ * @returns {Array|null} Parsed events or null
+ */
 function parseQwenCliEvents(rawOutput) {
     const trimmed = rawOutput.trim();
     if (!trimmed) {
@@ -379,6 +484,12 @@ function parseQwenCliEvents(rawOutput) {
     }
     return null;
 }
+
+/**
+ * Extracts response text from CLI events
+ * @param {Array} events - Parsed CLI events
+ * @returns {string|null} Extracted text or null
+ */
 function extractQwenCliText(events) {
     for (let index = events.length - 1; index >= 0; index -= 1) {
         const event = events[index];
@@ -404,9 +515,24 @@ function extractQwenCliText(events) {
     }
     return null;
 }
+/**
+ * Creates SSE formatted chunk for streaming responses
+ * @param {Object} data - Data to stringify and send
+ * @returns {string} SSE formatted string chunk
+ */
 function createSseResponseChunk(data) {
     return `data: ${JSON.stringify(data)}\n\n`;
 }
+
+/**
+ * Creates Response object matching OpenAI completion format
+ * Handles both streaming (SSE) and non-streaming responses
+ * @param {string} model - Model ID used
+ * @param {string} content - Completion text content
+ * @param {Object} context - Request context for logging
+ * @param {boolean} streamMode - Whether to return streaming response
+ * @returns {Response} Formatted completion response
+ */
 function makeQwenCliCompletionResponse(model, content, context, streamMode) {
     if (LOGGING_ENABLED) {
         logInfo("Qwen CLI fallback returned completion", {
@@ -421,6 +547,7 @@ function makeQwenCliCompletionResponse(model, content, context, streamMode) {
         const encoder = new TextEncoder();
         const stream = new ReadableStream({
             start(controller) {
+                // Send first chunk with content
                 controller.enqueue(encoder.encode(createSseResponseChunk({
                     id: completionId,
                     object: "chat.completion.chunk",
@@ -434,6 +561,7 @@ function makeQwenCliCompletionResponse(model, content, context, streamMode) {
                         },
                     ],
                 })));
+                // Send stop chunk
                 controller.enqueue(encoder.encode(createSseResponseChunk({
                     id: completionId,
                     object: "chat.completion.chunk",
@@ -447,6 +575,7 @@ function makeQwenCliCompletionResponse(model, content, context, streamMode) {
                         },
                     ],
                 })));
+                // Send DONE marker
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
                 controller.close();
             },
@@ -460,6 +589,7 @@ function makeQwenCliCompletionResponse(model, content, context, streamMode) {
             },
         });
     }
+    // Non-streaming response format
     const body = {
         id: `chatcmpl-${randomUUID()}`,
         object: "chat.completion",
@@ -489,6 +619,13 @@ function makeQwenCliCompletionResponse(model, content, context, streamMode) {
         },
     });
 }
+/**
+ * Executes qwen CLI as fallback when API quota is exceeded
+ * @param {Object} payload - Original request payload
+ * @param {Object} context - Request context for logging
+ * @param {AbortSignal} [abortSignal] - Abort controller signal
+ * @returns {Promise<{ ok: boolean, response?: Response, reason?: string, stdout?: string, stderr?: string }>} Fallback execution result
+ */
 async function runQwenCliFallback(payload, context, abortSignal) {
     const model = typeof payload?.model === "string" && payload.model.length > 0 ? payload.model : "coder-model";
     const streamMode = payload?.stream === true;
@@ -600,6 +737,14 @@ async function runQwenCliFallback(payload, context, abortSignal) {
         });
     });
 }
+
+/**
+ * Creates Response object for quota/rate limit errors
+ * @param {string} text - Response body text
+ * @param {HeadersInit} sourceHeaders - Original response headers
+ * @param {Object} context - Request context for logging
+ * @returns {Response} Formatted error response
+ */
 function makeQuotaFailFastResponse(text, sourceHeaders, context) {
     const headers = new Headers(sourceHeaders);
     headers.set("content-type", "application/json");
@@ -625,6 +770,12 @@ function makeQuotaFailFastResponse(text, sourceHeaders, context) {
         headers,
     });
 }
+/**
+ * Performs fetch request with timeout protection
+ * @param {Request|string} input - Fetch input
+ * @param {RequestInit} requestInit - Fetch options
+ * @returns {Promise<Response>} Fetch response
+ */
 async function sendWithTimeout(input, requestInit) {
     const composed = createRequestSignalWithTimeout(requestInit.signal, CHAT_REQUEST_TIMEOUT_MS);
     try {
@@ -637,6 +788,12 @@ async function sendWithTimeout(input, requestInit) {
         composed.cleanup();
     }
 }
+
+/**
+ * Injects required DashScope OAuth headers into fetch request
+ * Ensures compatibility even if OpenCode doesn't call chat.headers hook
+ * @param {RequestInit} requestInit - Fetch options to modify
+ */
 function applyDashScopeHeaders(requestInit) {
     // Ensure required DashScope OAuth headers are always present.
     // This mirrors qwen-code (DashScopeOpenAICompatibleProvider.buildHeaders) behavior.
@@ -676,6 +833,14 @@ function applyDashScopeHeaders(requestInit) {
         }
     }
 }
+
+/**
+ * Custom fetch wrapper for OpenCode SDK
+ * Handles token limits, DashScope headers, retries, and quota error fallback
+ * @param {Request|string} input - Fetch input
+ * @param {RequestInit} [init] - Fetch options
+ * @returns {Promise<Response>} API response or fallback response
+ */
 async function failFastFetch(input, init) {
     const normalized = await normalizeFetchInvocation(input, init);
     const requestInput = normalized.requestInput;
@@ -718,84 +883,93 @@ async function failFastFetch(input, init) {
     }
     try {
         let response = await sendWithTimeout(requestInput, requestInit);
-        if (LOGGING_ENABLED) {
-            logInfo("Qwen request response", {
-                request_id: context.requestId,
-                sessionID: context.sessionID,
-                modelID: context.modelID,
-                status: response.status,
-                attempt: 1,
-            });
-        }
-        if (response.status === 429) {
-            const firstBody = await response.text().catch(() => "");
-            if (payload && isInsufficientQuota(firstBody)) {
-                const degradedPayload = createQuotaDegradedPayload(payload);
-                if (degradedPayload) {
-                    const fallbackInit = { ...requestInit };
-                    applyJsonRequestBody(fallbackInit, degradedPayload);
-                    if (LOGGING_ENABLED) {
-                        logWarn("Retrying once with degraded payload after 429 insufficient_quota", {
-                            request_id: context.requestId,
-                            sessionID: context.sessionID,
-                            modelID: context.modelID,
-                            attempt: 2,
-                        });
-                    }
-                    response = await sendWithTimeout(requestInput, fallbackInit);
-                    if (LOGGING_ENABLED) {
-                        logInfo("Qwen request response", {
-                            request_id: context.requestId,
-                            sessionID: context.sessionID,
-                            modelID: context.modelID,
-                            status: response.status,
-                            attempt: 2,
-                        });
-                    }
-                    if (response.status !== 429) {
-                        return response;
-                    }
-                    const fallbackBody = await response.text().catch(() => "");
-                    if (ENABLE_CLI_FALLBACK) {
-                        const cliFallback = await runQwenCliFallback(payload, context, sourceSignal);
-                        if (cliFallback.ok) {
-                            return cliFallback.response;
+        const MAX_REQUEST_RETRIES = 3;
+        for (let retryAttempt = 0; retryAttempt <= MAX_REQUEST_RETRIES; retryAttempt++) {
+            if (LOGGING_ENABLED) {
+                logInfo("Qwen request response", {
+                    request_id: context.requestId,
+                    sessionID: context.sessionID,
+                    modelID: context.modelID,
+                    status: response.status,
+                    attempt: retryAttempt + 1,
+                });
+            }
+const RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504];
+            if (RETRYABLE_STATUS_CODES.includes(response.status)) {
+                if (response.status === 429) {
+                    const firstBody = await response.text().catch(() => "");
+                    if (payload && isInsufficientQuota(firstBody)) {
+                        const degradedPayload = createQuotaDegradedPayload(payload);
+                        if (degradedPayload) {
+                            const fallbackInit = { ...requestInit };
+                            applyJsonRequestBody(fallbackInit, degradedPayload);
+                            if (LOGGING_ENABLED) {
+                                logWarn(`Retrying with degraded payload after ${response.status} insufficient_quota, attempt ${retryAttempt + 2}/${MAX_REQUEST_RETRIES + 1}`, {
+                                    request_id: context.requestId,
+                                    sessionID: context.sessionID,
+                                    modelID: context.modelID,
+                                });
+                            }
+                            response = await sendWithTimeout(requestInput, fallbackInit);
+                            if (retryAttempt < MAX_REQUEST_RETRIES) {
+                                continue;
+                            }
+                            const fallbackBody = await response.text().catch(() => "");
+                            if (ENABLE_CLI_FALLBACK) {
+                                const cliFallback = await runQwenCliFallback(payload, context, sourceSignal);
+                                if (cliFallback.ok) {
+                                    return cliFallback.response;
+                                }
+                                if (cliFallback.reason === "cli_aborted") {
+                                    return makeFailFastErrorResponse(400, "request_aborted", "Qwen request was aborted");
+                                }
+                                if (LOGGING_ENABLED) {
+                                    logWarn("Qwen CLI fallback failed", {
+                                        request_id: context.requestId,
+                                        sessionID: context.sessionID,
+                                        modelID: context.modelID,
+                                        reason: cliFallback.reason,
+                                        stderr: cliFallback.stderr,
+                                    });
+                                }
+                            }
+                            return makeQuotaFailFastResponse(fallbackBody, response.headers, context);
                         }
-                        if (cliFallback.reason === "cli_aborted") {
-                            return makeFailFastErrorResponse(400, "request_aborted", "Qwen request was aborted");
-                        }
-                        if (LOGGING_ENABLED) {
-                            logWarn("Qwen CLI fallback failed", {
-                                request_id: context.requestId,
-                                sessionID: context.sessionID,
-                                modelID: context.modelID,
-                                reason: cliFallback.reason,
-                                stderr: cliFallback.stderr,
-                            });
+                        if (ENABLE_CLI_FALLBACK) {
+                            const cliFallback = await runQwenCliFallback(payload, context, sourceSignal);
+                            if (cliFallback.ok) {
+                                return cliFallback.response;
+                            }
+                            if (cliFallback.reason === "cli_aborted") {
+                                return makeFailFastErrorResponse(400, "request_aborted", "Qwen request was aborted");
+                            }
+                            if (LOGGING_ENABLED) {
+                                logWarn("Qwen CLI fallback failed", {
+                                    request_id: context.requestId,
+                                    sessionID: context.sessionID,
+                                    modelID: context.modelID,
+                                    reason: cliFallback.reason,
+                                    stderr: cliFallback.stderr,
+                                });
+                            }
                         }
                     }
-                    return makeQuotaFailFastResponse(fallbackBody, response.headers, context);
+                    return makeQuotaFailFastResponse(firstBody, response.headers, context);
                 }
-                if (ENABLE_CLI_FALLBACK) {
-                    const cliFallback = await runQwenCliFallback(payload, context, sourceSignal);
-                    if (cliFallback.ok) {
-                        return cliFallback.response;
-                    }
-                    if (cliFallback.reason === "cli_aborted") {
-                        return makeFailFastErrorResponse(400, "request_aborted", "Qwen request was aborted");
-                    }
+                if (retryAttempt < MAX_REQUEST_RETRIES) {
                     if (LOGGING_ENABLED) {
-                        logWarn("Qwen CLI fallback failed", {
+                        logWarn(`Retrying after ${response.status}, attempt ${retryAttempt + 2}/${MAX_REQUEST_RETRIES + 1}`, {
                             request_id: context.requestId,
                             sessionID: context.sessionID,
                             modelID: context.modelID,
-                            reason: cliFallback.reason,
-                            stderr: cliFallback.stderr,
                         });
                     }
+                    await new Promise(r => setTimeout(r, (retryAttempt + 1) * 1000));
+                    response = await sendWithTimeout(requestInput, requestInit);
+                    continue;
                 }
             }
-            return makeQuotaFailFastResponse(firstBody, response.headers, context);
+            return response;
         }
         return response;
     }
@@ -814,8 +988,8 @@ async function failFastFetch(input, init) {
  * Get valid access token from SDK auth state, refresh if expired.
  * Uses getAuth() from SDK instead of reading file directly.
  *
- * @param getAuth - Function to get auth state from SDK
- * @returns Access token or null
+ * @param {Function} getAuth - Function to get auth state from SDK
+ * @returns {Promise<string|null>} Access token or null if not available
  */
 async function getValidAccessToken(getAuth) {
     const diskToken = await getValidToken();
@@ -864,9 +1038,11 @@ async function getValidAccessToken(getAuth) {
     }
     return accessToken ?? null;
 }
+
 /**
  * Get base URL from token stored on disk (resource_url).
  * Falls back to DashScope compatible-mode if not available.
+ * @returns {string} DashScope API base URL
  */
 function getBaseUrl() {
     try {
@@ -880,8 +1056,13 @@ function getBaseUrl() {
     }
     return getApiBaseUrl();
 }
+
 /**
  * Alibaba Qwen OAuth authentication plugin for opencode
+ * Integrates Qwen OAuth device flow and API handling into opencode SDK
+ * 
+ * @param {*} _input - Plugin initialization input
+ * @returns {Promise<Object>} Plugin configuration and hooks
  *
  * @example
  * ```json
@@ -1047,6 +1228,13 @@ export const QwenAuthPlugin = async (_input) => {
             };
             config.provider = providers;
         },
+        /**
+         * Apply dynamic chat parameters before sending request
+         * Ensures tokens and timeouts don't exceed plugin limits
+         * 
+         * @param {*} input - Original chat request parameters
+         * @param {*} output - Final payload to be sent
+         */
         "chat.params": async (input, output) => {
             try {
                 output.options = output.options || {};
@@ -1092,6 +1280,9 @@ export const QwenAuthPlugin = async (_input) => {
          * Send DashScope headers like original CLI.
          * X-DashScope-CacheControl: enable prompt caching, reduce token consumption.
          * X-DashScope-AuthType: specify auth method for server.
+         * 
+         * @param {*} input - Original chat request parameters
+         * @param {*} output - Final payload to be sent
          */
         "chat.headers": async (input, output) => {
             try {
