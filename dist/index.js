@@ -1397,6 +1397,114 @@ export const QwenAuthPlugin = async (_input) => {
                         };
                     },
                 },
+                {
+                    label: "Add another Qwen account (multi-account switch)",
+                    type: "oauth",
+                    /**
+                     * Them account Qwen phu de auto-switch khi account chinh het quota.
+                     * Luon tao account moi (forceNew), khong ghi de account cu.
+                     * Account moi khong duoc dat active ngay (setActive: false).
+                     */
+                    authorize: async () => {
+                        const pkce = await createPKCE();
+                        const deviceAuth = await requestDeviceCode(pkce);
+                        if (!deviceAuth) {
+                            throw new Error("Failed to request device code");
+                        }
+                        console.log(`\n[Add Account] Please visit: ${deviceAuth.verification_uri}`);
+                        console.log(`[Add Account] Enter code: ${deviceAuth.user_code}\n`);
+                        const verificationUrl = deviceAuth.verification_uri_complete || deviceAuth.verification_uri;
+                        return {
+                            url: verificationUrl,
+                            method: "auto",
+                            instructions: "Login with a DIFFERENT Qwen account to add it as backup for auto-switch.",
+                            callback: async () => {
+                                let pollInterval = (deviceAuth.interval || 5) * 1000;
+                                const POLLING_MARGIN_MS = 3000;
+                                const maxInterval = DEVICE_FLOW.MAX_POLL_INTERVAL;
+                                const startTime = Date.now();
+                                const expiresIn = deviceAuth.expires_in * 1000;
+                                let consecutivePollFailures = 0;
+                                while (Date.now() - startTime < expiresIn) {
+                                    await new Promise(resolve => setTimeout(resolve, pollInterval + POLLING_MARGIN_MS));
+                                    const result = await pollForToken(deviceAuth.device_code, pkce.verifier);
+                                    if (result.type === "success") {
+                                        // Luu vao legacy token file de loader co the doc
+                                        saveToken(result);
+                                        // forceNew: luon tao account moi, khong match account cu
+                                        // setActive: false - giu account hien tai, chi them du phong
+                                        const savedAccount = await upsertOAuthAccount(result, {
+                                            setActive: false,
+                                            forceNew: true,
+                                        });
+                                        if (LOGGING_ENABLED) {
+                                            logInfo("Added new backup Qwen account", {
+                                                accountId: savedAccount?.accountId,
+                                                totalAccounts: savedAccount?.totalAccountCount,
+                                                healthyAccounts: savedAccount?.healthyAccountCount,
+                                            });
+                                        }
+                                        console.log(`[Add Account] Success! Account added. Total accounts: ${savedAccount?.totalAccountCount || "?"}`);
+                                        // Khoi phuc legacy token file (oauth_creds.json) ve active account
+                                        // de loader doc dung token cua account chinh, khong dung token account moi
+                                        try {
+                                            const activeAcct = await getActiveOAuthAccount({ allowExhausted: true });
+                                            if (activeAcct?.accessToken) {
+                                                // getActiveOAuthAccount da tu dong sync vao oauth_creds.json
+                                                // nen khong can goi saveToken thu cong
+                                            }
+                                        } catch (_restoreError) {
+                                            // Khong anh huong chuc nang chinh
+                                        }
+                                        return {
+                                            type: "success",
+                                            access: result.access,
+                                            refresh: result.refresh,
+                                            expires: result.expires,
+                                        };
+                                    }
+                                    if (result.type === "slow_down") {
+                                        consecutivePollFailures = 0;
+                                        pollInterval = Math.min(pollInterval + 5000, maxInterval);
+                                        continue;
+                                    }
+                                    if (result.type === "pending") {
+                                        consecutivePollFailures = 0;
+                                        continue;
+                                    }
+                                    if (result.type === "failed") {
+                                        if (result.fatal) {
+                                            logError("OAuth token polling failed with fatal error (add-account)", {
+                                                status: result.status,
+                                                error: result.error,
+                                                description: result.description,
+                                            });
+                                            return { type: "failed" };
+                                        }
+                                        consecutivePollFailures += 1;
+                                        logWarn(`OAuth token polling failed (add-account) (${consecutivePollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`);
+                                        if (consecutivePollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+                                            console.error("[qwen-oauth-plugin] OAuth token polling failed repeatedly (add-account)");
+                                            return { type: "failed" };
+                                        }
+                                        continue;
+                                    }
+                                    if (result.type === "denied") {
+                                        console.error("[qwen-oauth-plugin] Device authorization was denied (add-account)");
+                                        return { type: "failed" };
+                                    }
+                                    if (result.type === "expired") {
+                                        console.error("[qwen-oauth-plugin] Device authorization code expired (add-account)");
+                                        return { type: "failed" };
+                                    }
+                                    return { type: "failed" };
+                                }
+                                console.error("[qwen-oauth-plugin] Device authorization timed out (add-account)");
+                                return { type: "failed" };
+                            },
+                        };
+                    },
+                },
             ],
         },
         /**

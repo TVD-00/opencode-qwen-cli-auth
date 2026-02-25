@@ -45,6 +45,7 @@ export declare function upsertOAuthAccount(tokenResult: TokenResult, options?: {
     accountId?: string;
     accountKey?: string;
     setActive?: boolean;
+    forceNew?: boolean;
 }): Promise<{
     accountId: string;
     accessToken: string;

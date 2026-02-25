@@ -1056,14 +1056,17 @@ export async function upsertOAuthAccount(tokenResult, options = {}) {
     await withAccountsStoreLock((store) => {
         const now = Date.now();
         let index = -1;
-        if (typeof options.accountId === "string" && options.accountId.length > 0) {
-            index = store.accounts.findIndex(account => account.id === options.accountId);
-        }
-        if (index < 0 && accountKey) {
-            index = store.accounts.findIndex(account => account.accountKey === accountKey);
-        }
-        if (index < 0) {
-            index = store.accounts.findIndex(account => account.token?.refresh_token === tokenData.refresh_token);
+        // forceNew: bo qua match, luon tao account moi (dung cho "Add another account")
+        if (!options.forceNew) {
+            if (typeof options.accountId === "string" && options.accountId.length > 0) {
+                index = store.accounts.findIndex(account => account.id === options.accountId);
+            }
+            if (index < 0 && accountKey) {
+                index = store.accounts.findIndex(account => account.accountKey === accountKey);
+            }
+            if (index < 0) {
+                index = store.accounts.findIndex(account => account.token?.refresh_token === tokenData.refresh_token);
+            }
         }
         if (index < 0) {
             const newId = typeof options.accountId === "string" && options.accountId.length > 0
@@ -1105,7 +1108,7 @@ export async function getActiveOAuthAccount(options = {}) {
         ? options.preferredAccountId
         : null;
     const attemptedAuthRejected = new Set();
-    for (;;) {
+    for (; ;) {
         const lockPath = await acquireAccountsLock();
         let selected = null;
         let dirty = false;
