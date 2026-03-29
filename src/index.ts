@@ -11,7 +11,7 @@
  * 
  * @license MIT with Usage Disclaimer (see LICENSE file)
  * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
- * @version 2.4.0
+ * @version 2.4.1
  */
 
 import { randomUUID } from "node:crypto";
@@ -38,6 +38,8 @@ import type { TokenSuccess, HeadersInput } from "./lib/types.js";
 
 /** Request timeout — matches CLI's DEFAULT_TIMEOUT (120 seconds) */
 const CHAT_REQUEST_TIMEOUT_MS = 120000;
+/** Stream inactivity timeout — abort if no data chunk arrives within this window */
+const STREAM_INACTIVITY_TIMEOUT_MS = 45000;
 /** Maximum number of retry attempts for failed requests */
 const CHAT_MAX_RETRIES = 3;
 /** Output token cap for coder-model (64K tokens) */
@@ -1128,13 +1130,113 @@ function makeQuotaFailFastResponse(text: string, sourceHeaders: HeadersInit, con
 async function sendWithTimeout(input: string, requestInit: RequestInit): Promise<Response> {
     const composed = createRequestSignalWithTimeout(requestInit.signal, CHAT_REQUEST_TIMEOUT_MS);
     try {
-        return await fetch(input, {
+        const response = await fetch(input, {
             ...requestInit,
             signal: composed.signal,
         });
-    } finally {
+        // For non-streaming or error responses, cleanup immediately
+        // For streaming 200 responses, cleanup is deferred to wrapResponseWithStreamWatchdog
+        if (!response.ok || !response.body) {
+            composed.cleanup();
+        }
+        // Attach cleanup so the caller can defer it for streaming responses
+        (response as ResponseWithCleanup).__timeoutCleanup = composed.cleanup;
+        return response;
+    } catch (error: unknown) {
         composed.cleanup();
+        throw error;
     }
+}
+
+/** Extended Response type with deferred timeout cleanup */
+interface ResponseWithCleanup extends Response {
+    __timeoutCleanup?: () => void;
+}
+
+/**
+ * Wraps a streaming Response body with an inactivity watchdog.
+ * If no data chunk arrives within STREAM_INACTIVITY_TIMEOUT_MS, the stream is aborted.
+ * This prevents indefinite hangs when the server stops sending data mid-stream.
+ *
+ * Also cleans up the original request timeout when the stream ends or aborts.
+ *
+ * @param response - The original fetch Response (must have a readable body)
+ * @param inactivityTimeoutMs - Max ms allowed between consecutive data chunks
+ * @returns A new Response with the watchdog-wrapped body
+ */
+function wrapResponseWithStreamWatchdog(
+    response: Response,
+    inactivityTimeoutMs: number = STREAM_INACTIVITY_TIMEOUT_MS,
+): Response {
+    const body = response.body;
+    if (!body) {
+        // No body to watch — clean up request timeout and return as-is
+        (response as ResponseWithCleanup).__timeoutCleanup?.();
+        return response;
+    }
+
+    const originalCleanup = (response as ResponseWithCleanup).__timeoutCleanup;
+    const reader = body.getReader();
+    let watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+    let aborted = false;
+
+    function resetWatchdog(controller: ReadableStreamDefaultController<Uint8Array>): void {
+        if (watchdogTimer) clearTimeout(watchdogTimer);
+        watchdogTimer = setTimeout(() => {
+            aborted = true;
+            logWarn("Stream inactivity timeout — no data received", {
+                timeoutMs: inactivityTimeoutMs,
+            });
+            controller.error(new Error(`Stream inactivity timeout after ${inactivityTimeoutMs}ms`));
+            reader.cancel().catch(() => {});
+            originalCleanup?.();
+        }, inactivityTimeoutMs);
+    }
+
+    function clearWatchdog(): void {
+        if (watchdogTimer) {
+            clearTimeout(watchdogTimer);
+            watchdogTimer = null;
+        }
+        originalCleanup?.();
+    }
+
+    const watchedStream = new ReadableStream<Uint8Array>({
+        start(controller) {
+            resetWatchdog(controller);
+        },
+        async pull(controller) {
+            try {
+                const { done, value } = await reader.read();
+                if (done) {
+                    clearWatchdog();
+                    controller.close();
+                    return;
+                }
+                // Data received — reset the inactivity timer
+                resetWatchdog(controller);
+                controller.enqueue(value);
+            } catch (error: unknown) {
+                clearWatchdog();
+                if (!aborted) {
+                    controller.error(error);
+                }
+            }
+        },
+        cancel() {
+            clearWatchdog();
+            reader.cancel().catch(() => {});
+        },
+    });
+
+    // Create a new Response with the watched stream, preserving headers/status
+    const watchedResponse = new Response(watchedStream, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+    });
+
+    return watchedResponse;
 }
 
 /**
@@ -1386,9 +1488,9 @@ async function failFastFetch(input: Request | string, init?: RequestInit, initia
                     continue;
                 }
             }
-            return response;
+            return wrapResponseWithStreamWatchdog(response);
         }
-        return response;
+        return wrapResponseWithStreamWatchdog(response);
     } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
         const lowered = message.toLowerCase();
