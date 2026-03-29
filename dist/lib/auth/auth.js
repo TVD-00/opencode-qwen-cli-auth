@@ -4,14 +4,12 @@
  * Handles token storage, refresh, and validation
  * @license MIT
  */
-
 import { generatePKCE } from "@openauthjs/openauth/pkce";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, renameSync, statSync } from "fs";
 import { dirname } from "path";
 import { QWEN_OAUTH, DEFAULT_QWEN_BASE_URL, TOKEN_REFRESH_BUFFER_MS, VERIFICATION_URI } from "../constants.js";
 import { getTokenPath, getQwenDir, getTokenLockPath, getLegacyTokenPath, getAccountsPath, getAccountsLockPath } from "../config.js";
 import { logError, logWarn, logInfo, LOGGING_ENABLED } from "../logger.js";
-
 /** Maximum number of retries for token refresh operations */
 const MAX_REFRESH_RETRIES = 2;
 /** Delay between retry attempts in milliseconds */
@@ -32,16 +30,17 @@ const LOCK_MAX_ATTEMPTS = 20;
 const ACCOUNT_STORE_VERSION = 1;
 /** Default cooldown when account hits insufficient_quota */
 const DEFAULT_QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1000;
-
 /**
  * Checks if an error is an AbortError (from AbortController)
  * @param {*} error - The error to check
  * @returns {boolean} True if error is an AbortError
  */
 function isAbortError(error) {
-    return typeof error === "object" && error !== null && ("name" in error) && error.name === "AbortError";
+    return (typeof error === "object" &&
+        error !== null &&
+        "name" in error &&
+        error.name === "AbortError");
 }
-
 /**
  * Checks if an error has a specific error code (for Node.js system errors)
  * @param {*} error - The error to check
@@ -49,16 +48,18 @@ function isAbortError(error) {
  * @returns {boolean} True if error has the specified code
  */
 function hasErrorCode(error, code) {
-    return typeof error === "object" && error !== null && ("code" in error) && error.code === code;
+    return (typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === code);
 }
-
 /**
  * Creates a promise that resolves after specified milliseconds
  * @param {number} ms - Milliseconds to sleep
  * @returns {Promise<void>} Promise that resolves after delay
  */
 function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 /**
  * Performs fetch with timeout using AbortController
@@ -88,7 +89,6 @@ async function fetchWithTimeout(url, init, timeoutMs = OAUTH_REQUEST_TIMEOUT_MS)
         clearTimeout(timeoutId);
     }
 }
-
 /**
  * Normalizes resource URL to valid HTTPS URL format
  * Adds https:// prefix if missing and validates URL format
@@ -116,7 +116,6 @@ function normalizeResourceUrl(resourceUrl) {
         return undefined;
     }
 }
-
 /**
  * Validates OAuth token response has required fields
  * @param {Object} json - Token response JSON
@@ -125,12 +124,12 @@ function normalizeResourceUrl(resourceUrl) {
  */
 function validateTokenResponse(json, context) {
     // Check access_token exists and is string
-    if (!json.access_token || typeof json.access_token !== "string") {
+    if (!json.access_token || typeof json.access_token !== "string" || json.access_token.trim().length === 0) {
         logError(`${context} missing access_token`);
         return false;
     }
     // Check refresh_token exists and is string
-    if (!json.refresh_token || typeof json.refresh_token !== "string") {
+    if (!json.refresh_token || typeof json.refresh_token !== "string" || json.refresh_token.trim().length === 0) {
         logError(`${context} missing refresh_token`);
         return false;
     }
@@ -165,7 +164,11 @@ function toStoredTokenData(data) {
                 : undefined;
     const resourceUrl = typeof raw.resource_url === "string" ? normalizeResourceUrl(raw.resource_url) : undefined;
     // Validate all required fields are present and valid
-    if (!accessToken || !refreshToken || typeof expiryDate !== "number" || !Number.isFinite(expiryDate) || expiryDate <= 0) {
+    if (!accessToken ||
+        !refreshToken ||
+        typeof expiryDate !== "number" ||
+        !Number.isFinite(expiryDate) ||
+        expiryDate <= 0) {
         return null;
     }
     return {
@@ -176,7 +179,6 @@ function toStoredTokenData(data) {
         resource_url: resourceUrl,
     };
 }
-
 function getQuotaCooldownMs() {
     const raw = process.env.OPENCODE_QWEN_QUOTA_COOLDOWN_MS;
     if (typeof raw !== "string" || raw.trim().length === 0) {
@@ -188,7 +190,6 @@ function getQuotaCooldownMs() {
     }
     return Math.floor(parsed);
 }
-
 function normalizeAccountStore(raw) {
     const fallback = {
         version: ACCOUNT_STORE_VERSION,
@@ -205,18 +206,27 @@ function normalizeAccountStore(raw) {
         if (!item || typeof item !== "object" || Array.isArray(item)) {
             continue;
         }
-        const token = toStoredTokenData(item.token);
+        const itemObj = item;
+        const token = toStoredTokenData(itemObj.token);
         if (!token) {
             continue;
         }
-        const id = typeof item.id === "string" && item.id.trim().length > 0
-            ? item.id.trim()
+        const id = typeof itemObj.id === "string" && itemObj.id.trim().length > 0
+            ? itemObj.id.trim()
             : `acct_${Math.random().toString(16).slice(2)}_${Date.now().toString(36)}`;
-        const createdAt = typeof item.createdAt === "number" && Number.isFinite(item.createdAt) ? item.createdAt : Date.now();
-        const updatedAt = typeof item.updatedAt === "number" && Number.isFinite(item.updatedAt) ? item.updatedAt : createdAt;
-        const exhaustedUntil = typeof item.exhaustedUntil === "number" && Number.isFinite(item.exhaustedUntil) ? item.exhaustedUntil : 0;
-        const lastErrorCode = typeof item.lastErrorCode === "string" ? item.lastErrorCode : undefined;
-        const accountKey = typeof item.accountKey === "string" && item.accountKey.trim().length > 0 ? item.accountKey.trim() : undefined;
+        const createdAt = typeof itemObj.createdAt === "number" && Number.isFinite(itemObj.createdAt)
+            ? itemObj.createdAt
+            : Date.now();
+        const updatedAt = typeof itemObj.updatedAt === "number" && Number.isFinite(itemObj.updatedAt)
+            ? itemObj.updatedAt
+            : createdAt;
+        const exhaustedUntil = typeof itemObj.exhaustedUntil === "number" && Number.isFinite(itemObj.exhaustedUntil)
+            ? itemObj.exhaustedUntil
+            : 0;
+        const lastErrorCode = typeof itemObj.lastErrorCode === "string" ? itemObj.lastErrorCode : undefined;
+        const accountKey = typeof itemObj.accountKey === "string" && itemObj.accountKey.trim().length > 0
+            ? itemObj.accountKey.trim()
+            : undefined;
         normalizedAccounts.push({
             id,
             token,
@@ -228,8 +238,10 @@ function normalizeAccountStore(raw) {
             updatedAt,
         });
     }
-    let activeAccountId = typeof input.activeAccountId === "string" && input.activeAccountId.length > 0 ? input.activeAccountId : null;
-    if (activeAccountId && !normalizedAccounts.some(account => account.id === activeAccountId)) {
+    let activeAccountId = typeof input.activeAccountId === "string" && input.activeAccountId.length > 0
+        ? input.activeAccountId
+        : null;
+    if (activeAccountId && !normalizedAccounts.some((account) => account.id === activeAccountId)) {
         activeAccountId = null;
     }
     if (!activeAccountId && normalizedAccounts.length > 0) {
@@ -241,7 +253,6 @@ function normalizeAccountStore(raw) {
         accounts: normalizedAccounts,
     };
 }
-
 function normalizeTokenResultToStored(tokenResult) {
     if (!tokenResult || tokenResult.type !== "success") {
         return null;
@@ -254,7 +265,6 @@ function normalizeTokenResultToStored(tokenResult) {
         resource_url: tokenResult.resourceUrl,
     });
 }
-
 function parseJwtPayloadSegment(token) {
     if (typeof token !== "string") {
         return null;
@@ -272,7 +282,6 @@ function parseJwtPayloadSegment(token) {
         return null;
     }
 }
-
 function deriveAccountKeyFromToken(tokenData) {
     if (!tokenData || typeof tokenData !== "object") {
         return null;
@@ -292,7 +301,6 @@ function deriveAccountKeyFromToken(tokenData) {
     }
     return null;
 }
-
 function buildAccountEntry(tokenData, accountId, accountKey) {
     const now = Date.now();
     return {
@@ -306,7 +314,6 @@ function buildAccountEntry(tokenData, accountId, accountKey) {
         updatedAt: now,
     };
 }
-
 function writeAccountsStoreData(store) {
     const accountsPath = getAccountsPath();
     const accountsDir = dirname(accountsPath);
@@ -321,7 +328,7 @@ function writeAccountsStoreData(store) {
     const payload = {
         version: ACCOUNT_STORE_VERSION,
         activeAccountId: store.activeAccountId || null,
-        accounts: store.accounts.map(account => ({
+        accounts: store.accounts.map((account) => ({
             id: account.id,
             token: account.token,
             resource_url: account.resource_url,
@@ -346,11 +353,11 @@ function writeAccountsStoreData(store) {
             }
         }
         catch (_cleanupError) {
+            // ignore cleanup errors
         }
         throw error;
     }
 }
-
 function loadAccountsStoreData() {
     const path = getAccountsPath();
     if (!existsSync(path)) {
@@ -365,15 +372,14 @@ function loadAccountsStoreData() {
         return normalizeAccountStore(null);
     }
 }
-
 function pickNextHealthyAccount(store, excludedIds = new Set(), now = Date.now()) {
     const accounts = Array.isArray(store.accounts) ? store.accounts : [];
     if (accounts.length === 0) {
         return null;
     }
-    const activeIndex = accounts.findIndex(account => account.id === store.activeAccountId);
+    const activeIndex = accounts.findIndex((account) => account.id === store.activeAccountId);
     for (let step = 1; step <= accounts.length; step += 1) {
-        const index = activeIndex >= 0 ? (activeIndex + step) % accounts.length : (step - 1);
+        const index = activeIndex >= 0 ? (activeIndex + step) % accounts.length : step - 1;
         const candidate = accounts[index];
         if (!candidate || excludedIds.has(candidate.id)) {
             continue;
@@ -385,11 +391,9 @@ function pickNextHealthyAccount(store, excludedIds = new Set(), now = Date.now()
     }
     return null;
 }
-
 function countHealthyAccounts(store, now = Date.now()) {
-    return store.accounts.filter(account => !(typeof account.exhaustedUntil === "number" && account.exhaustedUntil > now)).length;
+    return store.accounts.filter((account) => !(typeof account.exhaustedUntil === "number" && account.exhaustedUntil > now)).length;
 }
-
 function syncAccountToLegacyTokenFile(account) {
     writeStoredTokenData({
         access_token: account.token.access_token,
@@ -399,7 +403,6 @@ function syncAccountToLegacyTokenFile(account) {
         resource_url: account.resource_url,
     });
 }
-
 /**
  * Builds token success object from stored token data
  * @param {Object} stored - Stored token data from file
@@ -444,11 +447,11 @@ function writeStoredTokenData(tokenData) {
             }
         }
         catch (_cleanupError) {
+            // ignore cleanup errors
         }
         throw error;
     }
 }
-
 /**
  * Migrates legacy token from old plugin location to new location
  * Checks if new token file exists, if not tries to migrate from legacy path
@@ -479,7 +482,6 @@ function migrateLegacyTokenIfNeeded() {
         logWarn("Failed to migrate legacy token:", error);
     }
 }
-
 function migrateLegacyTokenToAccountsIfNeeded() {
     const accountsPath = getAccountsPath();
     if (existsSync(accountsPath)) {
@@ -513,7 +515,7 @@ function migrateLegacyTokenToAccountsIfNeeded() {
 /**
  * Acquires exclusive lock for token refresh to prevent concurrent refreshes
  * Uses file-based locking with exponential backoff retry strategy
- * @returns {Promise<string>} Lock file path if acquired successfully
+ * @returns {Promise<LockHandle>} Lock handle if acquired successfully
  * @throws {Error} If lock cannot be acquired within timeout
  */
 async function acquireTokenLock() {
@@ -532,7 +534,7 @@ async function acquireTokenLock() {
                 flag: "wx",
                 mode: 0o600,
             });
-            return lockPath;
+            return { path: lockPath, value: lockValue };
         }
         catch (error) {
             // EEXIST means lock file already exists
@@ -553,6 +555,7 @@ async function acquireTokenLock() {
                             logWarn("Failed to remove stale token lock", staleError);
                         }
                     }
+                    await sleep(Math.floor(Math.random() * 50) + 10); // jitter to reduce race window
                     continue;
                 }
             }
@@ -568,24 +571,31 @@ async function acquireTokenLock() {
     }
     throw new Error("Token refresh lock timeout");
 }
-
 /**
- * Releases token refresh lock
+ * Releases token refresh lock, verifying ownership before deletion
  * Silently ignores errors if lock file doesn't exist
- * @param {string} lockPath - Path to lock file to release
+ * @param {LockHandle} handle - Lock handle returned by acquireTokenLock
  */
-function releaseTokenLock(lockPath) {
+function releaseTokenLock(handle) {
     try {
-        unlinkSync(lockPath);
+        // Verify we still own the lock before deleting
+        const current = readFileSync(handle.path, "utf-8");
+        if (current !== handle.value) {
+            logWarn("Lock file ownership changed, skipping release", {
+                path: handle.path,
+                expected: handle.value.slice(0, 20),
+                actual: current.slice(0, 20),
+            });
+            return;
+        }
+        unlinkSync(handle.path);
     }
     catch (error) {
-        // Ignore ENOENT (file not found) errors
         if (!hasErrorCode(error, "ENOENT")) {
             logWarn("Failed to release token lock file", error);
         }
     }
 }
-
 async function acquireAccountsLock() {
     const lockPath = getAccountsLockPath();
     const lockDir = dirname(lockPath);
@@ -601,7 +611,7 @@ async function acquireAccountsLock() {
                 flag: "wx",
                 mode: 0o600,
             });
-            return lockPath;
+            return { path: lockPath, value: lockValue };
         }
         catch (error) {
             if (!hasErrorCode(error, "EEXIST")) {
@@ -619,6 +629,7 @@ async function acquireAccountsLock() {
                             logWarn("Failed to remove stale accounts lock", staleError);
                         }
                     }
+                    await sleep(Math.floor(Math.random() * 50) + 10); // jitter to reduce race window
                     continue;
                 }
             }
@@ -633,10 +644,18 @@ async function acquireAccountsLock() {
     }
     throw new Error("Accounts lock timeout");
 }
-
-function releaseAccountsLock(lockPath) {
+function releaseAccountsLock(handle) {
     try {
-        unlinkSync(lockPath);
+        const current = readFileSync(handle.path, "utf-8");
+        if (current !== handle.value) {
+            logWarn("Accounts lock file ownership changed, skipping release", {
+                path: handle.path,
+                expected: handle.value.slice(0, 20),
+                actual: current.slice(0, 20),
+            });
+            return;
+        }
+        unlinkSync(handle.path);
     }
     catch (error) {
         if (!hasErrorCode(error, "ENOENT")) {
@@ -644,9 +663,8 @@ function releaseAccountsLock(lockPath) {
         }
     }
 }
-
 async function withAccountsStoreLock(mutator) {
-    const lockPath = await acquireAccountsLock();
+    const lockHandle = await acquireAccountsLock();
     try {
         const store = loadAccountsStoreData();
         const next = await mutator(store);
@@ -658,7 +676,7 @@ async function withAccountsStoreLock(mutator) {
         return store;
     }
     finally {
-        releaseAccountsLock(lockPath);
+        releaseAccountsLock(lockHandle);
     }
 }
 /**
@@ -687,7 +705,7 @@ export async function requestDeviceCode(pkce) {
             logError("device code request failed:", { status: res.status, text });
             return null;
         }
-        const json = await res.json();
+        const json = (await res.json());
         if (LOGGING_ENABLED) {
             logInfo("Device code response received:", json);
         }
@@ -697,8 +715,9 @@ export async function requestDeviceCode(pkce) {
             return null;
         }
         // Fix verification_uri_complete if missing client parameter
-        if (!json.verification_uri_complete || !json.verification_uri_complete.includes(VERIFICATION_URI.CLIENT_PARAM_KEY)) {
-            const baseUrl = json.verification_uri_complete || json.verification_uri;
+        if (!json.verification_uri_complete ||
+            !json.verification_uri_complete.includes(VERIFICATION_URI.CLIENT_PARAM_KEY)) {
+            const baseUrl = (json.verification_uri_complete || json.verification_uri);
             const separator = baseUrl.includes("?") ? "&" : "?";
             json.verification_uri_complete = `${baseUrl}${separator}${VERIFICATION_URI.CLIENT_PARAM_VALUE}`;
             if (LOGGING_ENABLED) {
@@ -736,9 +755,11 @@ export async function pollForToken(deviceCode, verifier, interval = 2) {
             }),
         });
         if (!res.ok) {
-            const json = await res.json().catch(() => ({}));
+            const json = (await res.json().catch(() => ({})));
             const errorCode = typeof json.error === "string" ? json.error : undefined;
-            const errorDescription = typeof json.error_description === "string" ? json.error_description : "No details provided";
+            const errorDescription = typeof json.error_description === "string"
+                ? json.error_description
+                : "No details provided";
             // Handle standard OAuth 2.0 Device Flow errors
             if (errorCode === "authorization_pending") {
                 return { type: "pending" };
@@ -766,7 +787,7 @@ export async function pollForToken(deviceCode, verifier, interval = 2) {
                 fatal: true,
             };
         }
-        const json = await res.json();
+        const json = (await res.json());
         if (LOGGING_ENABLED) {
             logInfo("Token response received:", {
                 has_access_token: !!json.access_token,
@@ -844,7 +865,7 @@ async function refreshAccessTokenOnce(refreshToken) {
                 fatal: isUnauthorized || isRateLimited || !transient,
             };
         }
-        const json = await res.json();
+        const json = (await res.json());
         if (LOGGING_ENABLED) {
             logInfo("Token refresh response received:", {
                 has_access_token: !!json.access_token,
@@ -896,11 +917,11 @@ async function refreshAccessTokenOnce(refreshToken) {
  */
 export async function refreshAccessToken(refreshToken) {
     // Acquire lock to prevent concurrent refresh operations
-    const lockPath = await acquireTokenLock();
+    const lockHandle = await acquireTokenLock();
     try {
         // Check if another process already refreshed the token
         const latest = loadStoredToken();
-        if (latest && !isTokenExpired(latest.expiry_date)) {
+        if (latest && !isTokenExpired(latest.expiry_date) && latest.refresh_token === refreshToken) {
             return buildTokenSuccessFromStored(latest);
         }
         // Use latest refresh token if available
@@ -913,10 +934,16 @@ export async function refreshAccessToken(refreshToken) {
                 return result;
             }
             // Non-retryable errors: 401/403 (unauthorized)
-            if (result.status === 401 || result.status === 403) {
+            if (result.status === 401 ||
+                result.status === 403) {
                 logError(`Refresh token rejected (${result.status}), re-authentication required`);
                 clearStoredToken();
-                return { type: "failed", status: result.status, error: "refresh_token_rejected", fatal: true };
+                return {
+                    type: "failed",
+                    status: result.status,
+                    error: "refresh_token_rejected",
+                    fatal: true,
+                };
             }
             // Non-retryable errors: 429 (rate limited)
             if (result.status === 429) {
@@ -941,7 +968,7 @@ export async function refreshAccessToken(refreshToken) {
     }
     finally {
         // Always release lock
-        releaseTokenLock(lockPath);
+        releaseTokenLock(lockHandle);
     }
 }
 /**
@@ -970,19 +997,6 @@ export function loadStoredToken() {
         if (!normalized) {
             logWarn("Invalid token data, re-authentication required");
             return null;
-        }
-        // Check if token file needs format update
-        const needsRewrite = typeof parsed.expiry_date !== "number" ||
-            typeof parsed.token_type !== "string" ||
-            typeof parsed.expires === "number" ||
-            parsed.resource_url !== normalized.resource_url;
-        if (needsRewrite) {
-            try {
-                writeStoredTokenData(normalized);
-            }
-            catch (rewriteError) {
-                logWarn("Failed to normalize token file format:", rewriteError);
-            }
         }
         return normalized;
     }
@@ -1033,7 +1047,6 @@ export function saveToken(tokenResult) {
         throw error;
     }
 }
-
 function buildRuntimeAccountResponse(account, healthyCount, totalCount, accessToken, resourceUrl) {
     return {
         accountId: account.id,
@@ -1044,7 +1057,6 @@ function buildRuntimeAccountResponse(account, healthyCount, totalCount, accessTo
         totalAccountCount: totalCount,
     };
 }
-
 export async function upsertOAuthAccount(tokenResult, options = {}) {
     const tokenData = normalizeTokenResultToStored(tokenResult);
     if (!tokenData) {
@@ -1053,46 +1065,52 @@ export async function upsertOAuthAccount(tokenResult, options = {}) {
     migrateLegacyTokenToAccountsIfNeeded();
     const accountKey = options.accountKey || deriveAccountKeyFromToken(tokenData);
     let selectedId = null;
-    await withAccountsStoreLock((store) => {
-        const now = Date.now();
-        let index = -1;
-        // forceNew: bo qua match, luon tao account moi (dung cho "Add another account")
-        if (!options.forceNew) {
-            if (typeof options.accountId === "string" && options.accountId.length > 0) {
-                index = store.accounts.findIndex(account => account.id === options.accountId);
-            }
-            if (index < 0 && accountKey) {
-                index = store.accounts.findIndex(account => account.accountKey === accountKey);
+    try {
+        await withAccountsStoreLock((store) => {
+            const now = Date.now();
+            let index = -1;
+            // forceNew: bo qua match, luon tao account moi (dung cho "Add another account")
+            if (!options.forceNew) {
+                if (typeof options.accountId === "string" && options.accountId.length > 0) {
+                    index = store.accounts.findIndex((account) => account.id === options.accountId);
+                }
+                if (index < 0 && accountKey) {
+                    index = store.accounts.findIndex((account) => account.accountKey === accountKey);
+                }
+                if (index < 0) {
+                    index = store.accounts.findIndex((account) => account.token?.refresh_token === tokenData.refresh_token);
+                }
             }
             if (index < 0) {
-                index = store.accounts.findIndex(account => account.token?.refresh_token === tokenData.refresh_token);
+                const newId = typeof options.accountId === "string" && options.accountId.length > 0
+                    ? options.accountId
+                    : `acct_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 10)}`;
+                store.accounts.push(buildAccountEntry(tokenData, newId, accountKey));
+                index = store.accounts.length - 1;
             }
-        }
-        if (index < 0) {
-            const newId = typeof options.accountId === "string" && options.accountId.length > 0
-                ? options.accountId
-                : `acct_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 10)}`;
-            store.accounts.push(buildAccountEntry(tokenData, newId, accountKey));
-            index = store.accounts.length - 1;
-        }
-        const target = store.accounts[index];
-        target.token = tokenData;
-        target.resource_url = tokenData.resource_url;
-        target.exhaustedUntil = 0;
-        target.lastErrorCode = undefined;
-        target.updatedAt = now;
-        if (!target.createdAt || !Number.isFinite(target.createdAt)) {
-            target.createdAt = now;
-        }
-        if (accountKey) {
-            target.accountKey = accountKey;
-        }
-        selectedId = target.id;
-        if (options.setActive || !store.activeAccountId) {
-            store.activeAccountId = target.id;
-        }
-        return store;
-    });
+            const target = store.accounts[index];
+            target.token = tokenData;
+            target.resource_url = tokenData.resource_url;
+            target.exhaustedUntil = 0;
+            target.lastErrorCode = undefined;
+            target.updatedAt = now;
+            if (!target.createdAt || !Number.isFinite(target.createdAt)) {
+                target.createdAt = now;
+            }
+            if (accountKey) {
+                target.accountKey = accountKey;
+            }
+            selectedId = target.id;
+            if (options.setActive || !store.activeAccountId) {
+                store.activeAccountId = target.id;
+            }
+            return store;
+        });
+    }
+    catch (error) {
+        logWarn("Failed to upsert OAuth account", error);
+        return null;
+    }
     if (!selectedId) {
         return null;
     }
@@ -1101,15 +1119,14 @@ export async function upsertOAuthAccount(tokenResult, options = {}) {
     }
     return getActiveOAuthAccount({ allowExhausted: true });
 }
-
 export async function getActiveOAuthAccount(options = {}) {
     migrateLegacyTokenToAccountsIfNeeded();
     const preferredAccountId = typeof options.preferredAccountId === "string" && options.preferredAccountId.length > 0
         ? options.preferredAccountId
         : null;
     const attemptedAuthRejected = new Set();
-    for (; ;) {
-        const lockPath = await acquireAccountsLock();
+    for (;;) {
+        const lockHandle = await acquireAccountsLock();
         let selected = null;
         let dirty = false;
         try {
@@ -1119,13 +1136,13 @@ export async function getActiveOAuthAccount(options = {}) {
                 return null;
             }
             if (attemptedAuthRejected.size === 0 && preferredAccountId) {
-                const exists = store.accounts.some(account => account.id === preferredAccountId);
+                const exists = store.accounts.some((account) => account.id === preferredAccountId);
                 if (exists && store.activeAccountId !== preferredAccountId) {
                     store.activeAccountId = preferredAccountId;
                     dirty = true;
                 }
             }
-            let active = store.accounts.find(account => account.id === store.activeAccountId);
+            let active = store.accounts.find((account) => account.id === store.activeAccountId);
             if (!active) {
                 active = store.accounts[0];
                 store.activeAccountId = active.id;
@@ -1150,11 +1167,16 @@ export async function getActiveOAuthAccount(options = {}) {
                 totalCount: store.accounts.length,
             };
             if (dirty) {
-                writeAccountsStoreData(store);
+                try {
+                    writeAccountsStoreData(store);
+                }
+                catch (writeError) {
+                    logWarn("Failed to persist account store changes", writeError);
+                }
             }
         }
         finally {
-            releaseAccountsLock(lockPath);
+            releaseAccountsLock(lockHandle);
         }
         if (!selected) {
             return null;
@@ -1167,15 +1189,15 @@ export async function getActiveOAuthAccount(options = {}) {
         }
         catch (error) {
             logWarn("Failed to sync active account token to oauth_creds.json", error);
-            return null;
+            // Non-fatal: continue with account data from memory
         }
         const valid = await getValidTokenDetailed({ clearOnFailure: false });
         if (valid.type === "success") {
             const latest = loadStoredToken();
-            if (latest) {
+            if (latest && latest.refresh_token === selected.account.token.refresh_token) {
                 try {
                     await withAccountsStoreLock((store) => {
-                        const target = store.accounts.find(account => account.id === selected.account.id);
+                        const target = store.accounts.find((account) => account.id === selected.account.id);
                         if (!target) {
                             return store;
                         }
@@ -1187,6 +1209,15 @@ export async function getActiveOAuthAccount(options = {}) {
                 }
                 catch (error) {
                     logWarn("Failed to update account token from refreshed legacy token", error);
+                }
+            }
+            else if (latest) {
+                if (LOGGING_ENABLED) {
+                    logWarn("Legacy token file was overwritten by another process, skipping write-back", {
+                        accountId: selected.account.id,
+                        expectedRefresh: selected.account.token.refresh_token?.slice(0, 8),
+                        actualRefresh: latest.refresh_token?.slice(0, 8),
+                    });
                 }
             }
             return buildRuntimeAccountResponse(selected.account, selected.healthyCount, selected.totalCount, valid.accessToken, valid.resourceUrl);
@@ -1208,7 +1239,7 @@ export async function getActiveOAuthAccount(options = {}) {
         try {
             await withAccountsStoreLock((store) => {
                 const now = Date.now();
-                const target = store.accounts.find(account => account.id === selected.account.id);
+                const target = store.accounts.find((account) => account.id === selected.account.id);
                 if (!target) {
                     return store;
                 }
@@ -1239,7 +1270,6 @@ export async function getActiveOAuthAccount(options = {}) {
         }
     }
 }
-
 export async function markOAuthAccountQuotaExhausted(accountId, errorCode = "insufficient_quota") {
     if (typeof accountId !== "string" || accountId.length === 0) {
         return null;
@@ -1249,7 +1279,7 @@ export async function markOAuthAccountQuotaExhausted(accountId, errorCode = "ins
     let outcome = null;
     await withAccountsStoreLock((store) => {
         const now = Date.now();
-        const target = store.accounts.find(account => account.id === accountId);
+        const target = store.accounts.find((account) => account.id === accountId);
         if (!target) {
             return store;
         }
@@ -1272,11 +1302,10 @@ export async function markOAuthAccountQuotaExhausted(accountId, errorCode = "ins
     });
     return outcome;
 }
-
 export async function switchToNextHealthyOAuthAccount(excludedAccountIds = []) {
     migrateLegacyTokenToAccountsIfNeeded();
     const excluded = new Set(Array.isArray(excludedAccountIds)
-        ? excludedAccountIds.filter(id => typeof id === "string" && id.length > 0)
+        ? excludedAccountIds.filter((id) => typeof id === "string" && id.length > 0)
         : []);
     let switchedId = null;
     await withAccountsStoreLock((store) => {
@@ -1297,7 +1326,6 @@ export async function switchToNextHealthyOAuthAccount(excludedAccountIds = []) {
         preferredAccountId: switchedId,
     });
 }
-
 /**
  * Checks if token is expired (with buffer)
  * @param {number} expiresAt - Token expiry timestamp in milliseconds
@@ -1306,7 +1334,6 @@ export async function switchToNextHealthyOAuthAccount(excludedAccountIds = []) {
 export function isTokenExpired(expiresAt) {
     return Date.now() >= expiresAt - TOKEN_REFRESH_BUFFER_MS;
 }
-
 async function getValidTokenDetailed(options = {}) {
     const clearOnFailure = options.clearOnFailure === true;
     const stored = loadStoredToken();
@@ -1331,7 +1358,9 @@ async function getValidTokenDetailed(options = {}) {
             resourceUrl: refreshResult.resourceUrl,
         };
     }
-    const status = typeof refreshResult.status === "number" ? refreshResult.status : undefined;
+    const status = typeof refreshResult.status === "number"
+        ? refreshResult.status
+        : undefined;
     const isAuthRejected = status === 401 ||
         status === 403 ||
         refreshResult.error === "refresh_token_rejected";
@@ -1351,13 +1380,12 @@ async function getValidTokenDetailed(options = {}) {
         error: refreshResult.error || "refresh_failed",
     };
 }
-
 /**
  * Gets valid access token, refreshing if expired
  * @returns {Promise<{ accessToken: string, resourceUrl?: string }|null>} Valid token or null if unavailable
  */
 export async function getValidToken() {
-    const result = await getValidTokenDetailed({ clearOnFailure: true });
+    const result = await getValidTokenDetailed({ clearOnFailure: false });
     if (result.type !== "success") {
         logError("Token refresh failed, re-authentication required");
         return null;
@@ -1367,7 +1395,6 @@ export async function getValidToken() {
         resourceUrl: result.resourceUrl,
     };
 }
-
 /**
  * Constructs DashScope API base URL from resource_url
  * @param {string} [resourceUrl] - Resource URL from token (optional)

@@ -119,8 +119,8 @@ Plugin tự động đính kèm các headers cần thiết cho DashScope OAuth:
 ```
 X-DashScope-AuthType: qwen-oauth
 X-DashScope-CacheControl: enable
-User-Agent: opencode-qwen-cli-auth/{version}
-X-DashScope-UserAgent: opencode-qwen-cli-auth/{version}
+User-Agent: QwenCode/{cli-version} ({platform}; {arch})
+X-DashScope-UserAgent: QwenCode/{cli-version} ({platform}; {arch})
 ```
 
 ## Xử lý lỗi

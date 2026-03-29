@@ -1,6 +1,6 @@
 {
   "name": "opencode-qwen-cli-auth",
-  "version": "2.3.9",
+  "version": "2.4.0",
   "description": "Qwen OAuth authentication plugin for opencode - use your Qwen account instead of API keys",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -27,7 +27,7 @@
     "url": "https://github.com/TVD-00/opencode-qwen-cli-auth/issues"
   },
   "scripts": {
-    "build": "tsc && node scripts/copy-fallback.mjs",
+    "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

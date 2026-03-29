@@ -1,116 +1,84 @@
-import type { PKCEPair, DeviceAuthorizationResponse, TokenResult, StoredTokenData } from "../types.js";
 /**
- * Request device authorization code
- * @param pkce - PKCE challenge/verifier pair
- * @returns Device authorization response with user code and verification URL
+ * @fileoverview OAuth authentication utilities for Qwen Plugin
+ * Implements OAuth 2.0 Device Authorization Grant flow (RFC 8628)
+ * Handles token storage, refresh, and validation
+ * @license MIT
+ */
+import type { StoredTokenData, PKCEPair, DeviceAuthorizationResponse, TokenResult, AccountResponse, OutcomeResponse } from "../types.js";
+/**
+ * Requests device code from Qwen OAuth server
+ * Initiates OAuth 2.0 Device Authorization Grant flow
+ * @param {{ challenge: string, verifier: string }} pkce - PKCE challenge and verifier
+ * @returns {Promise<Object|null>} Device auth response or null on failure
  */
 export declare function requestDeviceCode(pkce: PKCEPair): Promise<DeviceAuthorizationResponse | null>;
 /**
- * Poll for token using device code
- * @param deviceCode - Device code from authorization response
- * @param verifier - PKCE verifier
- * @param interval - Polling interval in seconds (from device response)
- * @returns Token result or null if still pending
+ * Polls Qwen OAuth server for access token using device code
+ * Implements OAuth 2.0 Device Flow polling with proper error handling
+ * @param {string} deviceCode - Device code from requestDeviceCode
+ * @param {string} verifier - PKCE code verifier
+ * @param {number} [interval=2] - Polling interval in seconds
+ * @returns {Promise<Object>} Token result object with type: success|pending|slow_down|failed|denied|expired
  */
 export declare function pollForToken(deviceCode: string, verifier: string, interval?: number): Promise<TokenResult>;
 /**
- * Refresh access token using refresh token
- * @param refreshToken - Refresh token
- * @returns Token result
+ * Refreshes access token using refresh token with lock coordination
+ * Implements retry logic for transient failures
+ * @param {string} refreshToken - Refresh token to use
+ * @returns {Promise<Object>} Token result object with type: success|failed
  */
 export declare function refreshAccessToken(refreshToken: string): Promise<TokenResult>;
 /**
- * Generate PKCE challenge and verifier
- * @returns PKCE pair
+ * Generates PKCE challenge and verifier for OAuth flow
+ * @returns {Promise<{challenge: string, verifier: string}>} PKCE challenge and verifier pair
  */
 export declare function createPKCE(): Promise<PKCEPair>;
 /**
- * Load stored token from disk
- * @returns Stored token data or null if not found
+ * Loads stored token from disk with legacy migration
+ * @returns {Object|null} Stored token data or null if not found/invalid
  */
 export declare function loadStoredToken(): StoredTokenData | null;
 /**
- * Xoa token luu tren disk khi token khong con hop le
+ * Clears stored token from both current and legacy paths
  */
 export declare function clearStoredToken(): void;
 /**
- * Save token to disk
- * @param tokenResult - Token result from OAuth flow
+ * Saves token result to disk
+ * @param {{ type: string, access: string, refresh: string, expires: number, resourceUrl?: string }} tokenResult - Token result from OAuth flow
+ * @throws {Error} If token result is invalid or write fails
  */
 export declare function saveToken(tokenResult: TokenResult): void;
-/**
- * Upsert OAuth account into ~/.qwen/oauth_accounts.json
- */
 export declare function upsertOAuthAccount(tokenResult: TokenResult, options?: {
     accountId?: string;
     accountKey?: string;
     setActive?: boolean;
     forceNew?: boolean;
-}): Promise<{
-    accountId: string;
-    accessToken: string;
-    resourceUrl?: string;
-    exhaustedUntil: number;
-    healthyAccountCount: number;
-    totalAccountCount: number;
-} | null>;
-/**
- * Get active OAuth account token from multi-account store
- */
+}): Promise<AccountResponse | null>;
 export declare function getActiveOAuthAccount(options?: {
     allowExhausted?: boolean;
     requireHealthy?: boolean;
     preferredAccountId?: string;
-}): Promise<{
-    accountId: string;
-    accessToken: string;
-    resourceUrl?: string;
-    exhaustedUntil: number;
-    healthyAccountCount: number;
-    totalAccountCount: number;
-} | null>;
+}): Promise<AccountResponse | null>;
+export declare function markOAuthAccountQuotaExhausted(accountId: string, errorCode?: string): Promise<OutcomeResponse | null>;
+export declare function switchToNextHealthyOAuthAccount(excludedAccountIds?: string[]): Promise<AccountResponse | null>;
 /**
- * Mark account as exhausted by insufficient_quota
- */
-export declare function markOAuthAccountQuotaExhausted(accountId: string, errorCode?: string): Promise<{
-    accountId: string;
-    exhaustedUntil: number;
-    healthyAccountCount: number;
-    totalAccountCount: number;
-} | null>;
-/**
- * Switch active account to next healthy one
- */
-export declare function switchToNextHealthyOAuthAccount(excludedAccountIds?: string[]): Promise<{
-    accountId: string;
-    accessToken: string;
-    resourceUrl?: string;
-    exhaustedUntil: number;
-    healthyAccountCount: number;
-    totalAccountCount: number;
-} | null>;
-/**
- * Check if token is expired (with 5 minute buffer)
- * @param expiresAt - Expiration timestamp in milliseconds
- * @returns True if token is expired or will expire soon
+ * Checks if token is expired (with buffer)
+ * @param {number} expiresAt - Token expiry timestamp in milliseconds
+ * @returns {boolean} True if token is expired or expiring soon
  */
 export declare function isTokenExpired(expiresAt: number): boolean;
 /**
- * Get valid access token, refreshing if necessary
- * @returns Access token and resource URL, or null if authentication required
+ * Gets valid access token, refreshing if expired
+ * @returns {Promise<{ accessToken: string, resourceUrl?: string }|null>} Valid token or null if unavailable
  */
 export declare function getValidToken(): Promise<{
     accessToken: string;
     resourceUrl?: string;
 } | null>;
 /**
- * Get Portal API base URL from token or use default
- * @param resourceUrl - Resource URL from token (optional)
- * @returns Portal API base URL
- *
- * IMPORTANT: Portal API uses /v1 path (not /api/v1)
- * - OAuth endpoints: /api/v1/oauth2/ (for authentication)
- * - Chat API: /v1/ (for completions)
+ * Constructs DashScope API base URL from resource_url
+ * @param {string} [resourceUrl] - Resource URL from token (optional)
+ * @returns {string} DashScope API base URL
  */
 export declare function getApiBaseUrl(resourceUrl?: string): string;
 //# sourceMappingURL=auth.d.ts.map

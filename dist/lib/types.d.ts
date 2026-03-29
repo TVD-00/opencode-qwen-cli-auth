@@ -182,5 +182,64 @@ export interface ErrorResponse {
     message: string;
     code?: string;
 }
+/**
+ * Account entry in the multi-account store
+ */
+export interface AccountEntry {
+    id: string;
+    token: StoredTokenData;
+    resource_url?: string;
+    exhaustedUntil: number;
+    lastErrorCode?: string;
+    accountKey?: string;
+    createdAt: number;
+    updatedAt: number;
+}
+/**
+ * Account store structure in ~/.qwen/oauth_accounts.json
+ */
+export interface AccountStore {
+    version: number;
+    activeAccountId: string | null;
+    accounts: AccountEntry[];
+}
+/**
+ * Runtime account response returned by getActiveOAuthAccount etc.
+ */
+export interface AccountResponse {
+    accountId: string;
+    accessToken: string;
+    resourceUrl?: string;
+    exhaustedUntil: number;
+    healthyAccountCount: number;
+    totalAccountCount: number;
+}
+/**
+ * Outcome response from markOAuthAccountQuotaExhausted
+ */
+export interface OutcomeResponse {
+    accountId: string;
+    exhaustedUntil: number;
+    healthyAccountCount: number;
+    totalAccountCount: number;
+}
+/**
+ * Result from getValidTokenDetailed
+ */
+export type ValidTokenDetailedResult = {
+    type: "success";
+    accessToken: string;
+    resourceUrl?: string;
+} | {
+    type: "missing";
+} | {
+    type: "auth_rejected";
+    status?: number;
+    error: string;
+} | {
+    type: "transient_or_unknown";
+    status?: number;
+    error: string;
+};
 export type { Auth, Provider, Model };
 //# sourceMappingURL=types.d.ts.map

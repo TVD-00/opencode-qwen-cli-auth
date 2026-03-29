@@ -1,3 +1,41 @@
+# Dependencies
 node_modules/
+
+# Build artifacts (dist/ is committed for direct GitHub installs)
+# dist/
+
+# npm pack output
 *.tgz
+
+# Source maps (generated during build, not needed in repo)
+*.js.map
+*.d.ts.map
+
+# OS files
 .DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Test coverage
+coverage/
+
+# Temporary files
+tmp/
+.tmp/

@@ -2,23 +2,40 @@
  * @fileoverview Alibaba Qwen OAuth Authentication Plugin for opencode
  * Main plugin entry point implementing OAuth 2.0 Device Authorization Grant
  * Handles authentication, request transformation, and error recovery
- *
+ * 
  * Architecture:
  * - OAuth flow: PKCE + Device Code Grant (RFC 8628)
  * - Token management: Automatic refresh with file-based storage
  * - Request handling: Custom fetch wrapper with retry logic
  * - Error recovery: Quota degradation and CLI fallback
- *
+ * 
  * @license MIT with Usage Disclaimer (see LICENSE file)
  * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
  * @version 2.4.0
  */
+
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { createPKCE, requestDeviceCode, pollForToken, getApiBaseUrl, saveToken, refreshAccessToken, loadStoredToken, getValidToken, upsertOAuthAccount, getActiveOAuthAccount, markOAuthAccountQuotaExhausted, switchToNextHealthyOAuthAccount, } from "./lib/auth/auth.js";
+import {
+    createPKCE,
+    requestDeviceCode,
+    pollForToken,
+    getApiBaseUrl,
+    saveToken,
+    refreshAccessToken,
+    loadStoredToken,
+    getValidToken,
+    upsertOAuthAccount,
+    getActiveOAuthAccount,
+    markOAuthAccountQuotaExhausted,
+    switchToNextHealthyOAuthAccount,
+} from "./lib/auth/auth.js";
 import { PROVIDER_ID, AUTH_LABELS, DEVICE_FLOW, PORTAL_HEADERS, TOKEN_REFRESH_BUFFER_MS } from "./lib/constants.js";
 import { logError, logInfo, logWarn, LOGGING_ENABLED } from "./lib/logger.js";
+import type { Plugin } from "@opencode-ai/plugin";
+import type { TokenSuccess, HeadersInput } from "./lib/types.js";
+
 /** Request timeout — matches CLI's DEFAULT_TIMEOUT (120 seconds) */
 const CHAT_REQUEST_TIMEOUT_MS = 120000;
 /** Maximum number of retry attempts for failed requests */
@@ -38,15 +55,16 @@ const ENABLE_CLI_FALLBACK = process.env.OPENCODE_QWEN_ENABLE_CLI_FALLBACK === "1
 /** Qwen CLI version to mimic */
 const QWEN_CLI_VERSION = "0.13.1";
 /** Build User-Agent matching official QwenCode CLI format */
-function buildQwenUserAgent() {
+function buildQwenUserAgent(): string {
     return `QwenCode/${QWEN_CLI_VERSION} (${process.platform}; ${process.arch})`;
 }
 const PLUGIN_USER_AGENT = buildQwenUserAgent();
 /** Output token limits per model for DashScope OAuth */
-const DASH_SCOPE_OUTPUT_LIMITS = {
+const DASH_SCOPE_OUTPUT_LIMITS: Record<string, number> = {
     "coder-model": 65536,
     "vision-model": 8192,
 };
+
 /** Minimum delay before first request in milliseconds (anti-burst) */
 const PRE_REQUEST_JITTER_MIN_MS = 30;
 /** Maximum delay before first request in milliseconds */
@@ -59,37 +77,38 @@ let lastRequestTimestamp = 0;
 const MAX_CONCURRENT_REQUESTS = 2;
 /** Maximum concurrent CLI fallback spawns */
 const MAX_CONCURRENT_CLI_SPAWNS = 1;
+
 /**
  * Generates a random delay within [min, max] range
  * Uses uniform distribution for natural-looking timing
  */
-function randomDelay(minMs, maxMs) {
+function randomDelay(minMs: number, maxMs: number): number {
     return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
 }
+
 /**
  * Simple async semaphore for concurrency control
  * Limits the number of concurrent operations to prevent burst detection and resource exhaustion
  */
 class AsyncSemaphore {
-    max;
-    current = 0;
-    waiters = [];
-    constructor(max) {
-        this.max = max;
-    }
-    async acquire() {
+    private current = 0;
+    private readonly waiters: Array<() => void> = [];
+
+    constructor(private readonly max: number) {}
+
+    async acquire(): Promise<void> {
         if (this.current < this.max) {
             this.current++;
             return;
         }
-        await new Promise((resolve) => {
+        await new Promise<void>((resolve) => {
             this.waiters.push(resolve);
         });
         this.current++;
     }
-    release() {
-        if (this.current <= 0)
-            return; // guard against underflow from double-release
+
+    release(): void {
+        if (this.current <= 0) return; // guard against underflow from double-release
         this.current--;
         const next = this.waiters.shift();
         if (next) {
@@ -97,46 +116,50 @@ class AsyncSemaphore {
         }
     }
 }
+
 /** Semaphore to limit concurrent API requests */
 const requestSemaphore = new AsyncSemaphore(MAX_CONCURRENT_REQUESTS);
 /** Semaphore to limit concurrent CLI fallback spawns */
 const cliFallbackSemaphore = new AsyncSemaphore(MAX_CONCURRENT_CLI_SPAWNS);
+
 /**
  * Promise chain that serializes request timing decisions.
  * Each caller waits for the previous timing slot to complete before
  * reading/writing lastRequestTimestamp, preventing the lost-update race
  * where N concurrent callers all read the same stale timestamp.
  */
-let timingChain = Promise.resolve();
+let timingChain: Promise<void> = Promise.resolve();
+
 /**
  * Enforces minimum gap between requests and adds jitter.
  * Serialized via promise chain to prevent concurrent callers from
  * bypassing the inter-request gap.
  */
-async function applyRequestTiming() {
+async function applyRequestTiming(): Promise<void> {
     const prev = timingChain;
-    let resolveMine;
-    timingChain = new Promise((r) => { resolveMine = r; });
+    let resolveMine!: () => void;
+    timingChain = new Promise<void>((r) => { resolveMine = r; });
     try {
         await prev; // wait for previous timing slot
         const now = Date.now();
         const elapsed = now - lastRequestTimestamp;
+
         if (lastRequestTimestamp > 0 && elapsed < INTER_REQUEST_GAP_MS) {
             // Enforce inter-request gap with slight randomization
             const gapWait = INTER_REQUEST_GAP_MS - elapsed + randomDelay(0, 100);
             await new Promise((r) => setTimeout(r, gapWait));
-        }
-        else {
+        } else {
             // Pre-request jitter for first request or after long gap
             const jitter = randomDelay(PRE_REQUEST_JITTER_MIN_MS, PRE_REQUEST_JITTER_MAX_MS);
             await new Promise((r) => setTimeout(r, jitter));
         }
+
         lastRequestTimestamp = Date.now();
-    }
-    finally {
+    } finally {
         resolveMine(); // unblock next waiter even if we threw
     }
 }
+
 /**
  * Calculates retry delay using exponential backoff with ±30% jitter
  * Matches the official Qwen CLI retry strategy exactly
@@ -145,18 +168,61 @@ async function applyRequestTiming() {
  * @param maxDelayMs - Maximum delay cap (default 30000ms)
  * @returns Delay in milliseconds with jitter applied
  */
-function calculateRetryDelay(attempt, initialDelayMs = 1500, maxDelayMs = 30000) {
+function calculateRetryDelay(attempt: number, initialDelayMs = 1500, maxDelayMs = 30000): number {
     const baseDelay = Math.min(initialDelayMs * Math.pow(2, attempt), maxDelayMs);
     const jitterFactor = 0.3 * (Math.random() * 2 - 1); // ±30%
     return Math.max(0, Math.floor(baseDelay * (1 + jitterFactor)));
 }
+
 /** Session ID for metadata — generated once per plugin load, mimics CLI behavior */
 const SESSION_ID = randomUUID();
+
 /** Generate a per-request prompt ID for metadata */
-function generatePromptId() {
+function generatePromptId(): string {
     return randomUUID();
 }
-function capPayloadMaxTokens(payload) {
+
+/**
+ * Request context for logging and tracking
+ */
+interface RequestContext {
+    requestId: string | undefined;
+    sessionID: string | undefined;
+    modelID: string | undefined;
+    accountID: string | null;
+}
+
+/**
+ * Result from CLI fallback execution
+ */
+interface CliFallbackResult {
+    ok: boolean;
+    response?: Response;
+    reason?: string;
+    stdout?: string;
+    stderr?: string;
+}
+
+/**
+ * Payload with optional token and request fields
+ */
+interface RequestPayload {
+    model?: string;
+    messages?: unknown[];
+    stream?: boolean;
+    max_tokens?: number;
+    max_completion_tokens?: number;
+    maxTokens?: number;
+    options?: Record<string, unknown>;
+    sessionID?: string;
+    stream_options?: unknown;
+    tools?: unknown;
+    tool_choice?: unknown;
+    parallel_tool_calls?: unknown;
+    [key: string]: unknown;
+}
+
+function capPayloadMaxTokens(payload: RequestPayload): RequestPayload {
     if (!payload || typeof payload !== "object") {
         return payload;
     }
@@ -166,7 +232,7 @@ function capPayloadMaxTokens(payload) {
     if (!limit) {
         return payload;
     }
-    const next = { ...payload };
+    const next: RequestPayload = { ...payload };
     let changed = false;
     if (typeof next.max_tokens === "number" && next.max_tokens > limit) {
         next.max_tokens = limit;
@@ -182,7 +248,7 @@ function capPayloadMaxTokens(payload) {
         changed = true;
     }
     if (next.options && typeof next.options === "object") {
-        const options = { ...next.options };
+        const options = { ...next.options } as Record<string, unknown>;
         let optionsChanged = false;
         if (typeof options.max_tokens === "number" && options.max_tokens > limit) {
             options.max_tokens = limit;
@@ -203,6 +269,7 @@ function capPayloadMaxTokens(payload) {
     }
     return changed ? next : payload;
 }
+
 const CLIENT_ONLY_BODY_FIELDS = new Set([
     "providerID",
     "provider",
@@ -212,13 +279,14 @@ const CLIENT_ONLY_BODY_FIELDS = new Set([
     "options",
     "debug",
 ]);
-function resolveQwenCliCommand() {
+
+function resolveQwenCliCommand(): string {
     const fromEnv = process.env.QWEN_CLI_PATH;
     if (typeof fromEnv === "string" && fromEnv.trim().length > 0) {
         return fromEnv.trim();
     }
     if (process.platform === "win32") {
-        const candidates = [];
+        const candidates: string[] = [];
         if (process.env.APPDATA) {
             candidates.push(`${process.env.APPDATA}\\npm\\qwen.cmd`);
         }
@@ -233,11 +301,14 @@ function resolveQwenCliCommand() {
     }
     return "qwen";
 }
+
 const QWEN_CLI_COMMAND = resolveQwenCliCommand();
-function requiresShellExecution(command) {
+
+function requiresShellExecution(command: string): boolean {
     return process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
 }
-function makeFailFastErrorResponse(status, code, message) {
+
+function makeFailFastErrorResponse(status: number, code: string, message: string): Response {
     return new Response(JSON.stringify({
         error: {
             message,
@@ -250,6 +321,7 @@ function makeFailFastErrorResponse(status, code, message) {
         headers: { "content-type": "application/json" },
     });
 }
+
 /**
  * Creates AbortSignal with timeout that composes with source signal
  * Properly cleans up timers and event listeners
@@ -257,15 +329,17 @@ function makeFailFastErrorResponse(status, code, message) {
  * @param {number} timeoutMs - Timeout in milliseconds
  * @returns {{ signal: AbortSignal, cleanup: () => void }} Composed signal and cleanup function
  */
-function createRequestSignalWithTimeout(sourceSignal, timeoutMs) {
+function createRequestSignalWithTimeout(
+    sourceSignal: AbortSignal | null | undefined,
+    timeoutMs: number,
+): { signal: AbortSignal; cleanup: () => void } {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(new Error("request_timeout")), timeoutMs);
     const onSourceAbort = () => controller.abort(sourceSignal?.reason);
     if (sourceSignal) {
         if (sourceSignal.aborted) {
             controller.abort(sourceSignal.reason);
-        }
-        else {
+        } else {
             sourceSignal.addEventListener("abort", onSourceAbort, { once: true });
         }
     }
@@ -279,36 +353,42 @@ function createRequestSignalWithTimeout(sourceSignal, timeoutMs) {
         },
     };
 }
+
 /**
  * Appends text chunk with size limit to prevent memory overflow
  * @param {string} current - Current text buffer
  * @param {string} chunk - New chunk to append
  * @returns {string} Combined text with size limit
  */
-function appendLimitedText(current, chunk) {
+function appendLimitedText(current: string, chunk: string): string {
     const next = current + chunk;
     if (next.length <= CLI_FALLBACK_MAX_BUFFER_CHARS) {
         return next;
     }
     return next.slice(next.length - CLI_FALLBACK_MAX_BUFFER_CHARS);
 }
+
 /**
  * Checks if value is a Request instance
  * @param {*} value - Value to check
  * @returns {boolean} True if value is a Request instance
  */
-function isRequestInstance(value) {
+function isRequestInstance(value: unknown): value is Request {
     return typeof Request !== "undefined" && value instanceof Request;
 }
+
 /**
  * Normalizes fetch invocation from Request object or URL string
  * @param {Request|string} input - Fetch input
  * @param {RequestInit} [init] - Fetch options
  * @returns {{ requestInput: *, requestInit: RequestInit }} Normalized fetch parameters
  */
-async function normalizeFetchInvocation(input, init) {
-    const requestInit = init ? { ...init } : {};
-    let requestInput = isRequestInstance(input) ? input.url : input;
+async function normalizeFetchInvocation(
+    input: Request | string,
+    init?: RequestInit,
+): Promise<{ requestInput: string; requestInit: RequestInit }> {
+    const requestInit: RequestInit = init ? { ...init } : {};
+    let requestInput: string = isRequestInstance(input) ? input.url : (input as string);
     if (!isRequestInstance(input)) {
         return { requestInput, requestInit };
     }
@@ -322,8 +402,7 @@ async function normalizeFetchInvocation(input, init) {
     if (requestInit.body === undefined) {
         try {
             requestInit.body = await input.clone().text();
-        }
-        catch (_error) {
+        } catch (_error: unknown) {
             // ignore
         }
     }
@@ -332,13 +411,14 @@ async function normalizeFetchInvocation(input, init) {
     }
     return { requestInput, requestInit };
 }
+
 /**
  * Gets header value from Headers object, array, or plain object
  * @param {Headers|Array|Object} headers - Headers to search
  * @param {string} headerName - Header name (case-insensitive)
  * @returns {string|undefined} Header value or undefined
  */
-function getHeaderValue(headers, headerName) {
+function getHeaderValue(headers: HeadersInput | null | undefined, headerName: string): string | undefined {
     if (!headers) {
         return undefined;
     }
@@ -357,7 +437,8 @@ function getHeaderValue(headers, headerName) {
     }
     return undefined;
 }
-function applyAuthorizationHeader(requestInit, accessToken) {
+
+function applyAuthorizationHeader(requestInit: RequestInit, accessToken: string): void {
     if (typeof accessToken !== "string" || accessToken.length === 0) {
         return;
     }
@@ -379,20 +460,21 @@ function applyAuthorizationHeader(requestInit, accessToken) {
         requestInit.headers.push(["authorization", bearer]);
         return;
     }
-    let existingKey = null;
-    for (const key of Object.keys(requestInit.headers)) {
+    let existingKey: string | null = null;
+    for (const key of Object.keys(requestInit.headers as Record<string, string>)) {
         if (key.toLowerCase() === "authorization") {
             existingKey = key;
             break;
         }
     }
     if (existingKey) {
-        requestInit.headers[existingKey] = bearer;
+        (requestInit.headers as Record<string, string>)[existingKey] = bearer;
         return;
     }
-    requestInit.headers["authorization"] = bearer;
+    (requestInit.headers as Record<string, string>)["authorization"] = bearer;
 }
-function rewriteRequestBaseUrl(requestInput, resourceUrl) {
+
+function rewriteRequestBaseUrl(requestInput: string, resourceUrl: string): string {
     if (typeof requestInput !== "string" || typeof resourceUrl !== "string" || resourceUrl.length === 0) {
         return requestInput;
     }
@@ -402,8 +484,10 @@ function rewriteRequestBaseUrl(requestInput, resourceUrl) {
         const baseSegments = targetBase.pathname.split("/").filter(Boolean);
         const currentSegments = current.pathname.split("/").filter(Boolean);
         let suffix = currentSegments;
-        if (currentSegments.length >= baseSegments.length &&
-            baseSegments.every((segment, index) => currentSegments[index] === segment)) {
+        if (
+            currentSegments.length >= baseSegments.length &&
+            baseSegments.every((segment, index) => currentSegments[index] === segment)
+        ) {
             suffix = currentSegments.slice(baseSegments.length);
         }
         const mergedPath = [...baseSegments, ...suffix].join("/");
@@ -411,17 +495,17 @@ function rewriteRequestBaseUrl(requestInput, resourceUrl) {
         targetBase.search = current.search;
         targetBase.hash = current.hash;
         return targetBase.toString();
-    }
-    catch (_error) {
+    } catch (_error: unknown) {
         return requestInput;
     }
 }
+
 /**
  * Applies JSON request body with proper content-type header
  * @param {RequestInit} requestInit - Fetch options
  * @param {Object} payload - Request payload
  */
-function applyJsonRequestBody(requestInit, payload) {
+function applyJsonRequestBody(requestInit: RequestInit, payload: RequestPayload): void {
     requestInit.body = JSON.stringify(payload);
     if (!requestInit.headers) {
         requestInit.headers = { "content-type": "application/json" };
@@ -441,47 +525,48 @@ function applyJsonRequestBody(requestInit, payload) {
         return;
     }
     let hasContentType = false;
-    for (const name of Object.keys(requestInit.headers)) {
+    for (const name of Object.keys(requestInit.headers as Record<string, string>)) {
         if (name.toLowerCase() === "content-type") {
             hasContentType = true;
             break;
         }
     }
     if (!hasContentType) {
-        requestInit.headers["content-type"] = "application/json";
+        (requestInit.headers as Record<string, string>)["content-type"] = "application/json";
     }
 }
+
 /**
  * Parses JSON request body if content-type is application/json
  * @param {RequestInit} requestInit - Fetch options
  * @returns {Object|null} Parsed payload or null
  */
-function parseJsonRequestBody(requestInit) {
+function parseJsonRequestBody(requestInit: RequestInit): RequestPayload | null {
     if (typeof requestInit.body !== "string") {
         return null;
     }
-    const contentType = getHeaderValue(requestInit.headers, "content-type");
+    const contentType = getHeaderValue(requestInit.headers as HeadersInput, "content-type");
     if (contentType && !contentType.toLowerCase().includes("application/json")) {
         return null;
     }
     try {
-        const parsed = JSON.parse(requestInit.body);
+        const parsed = JSON.parse(requestInit.body) as unknown;
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
             return null;
         }
-        return parsed;
-    }
-    catch (_error) {
+        return parsed as RequestPayload;
+    } catch (_error: unknown) {
         return null;
     }
 }
+
 /**
  * Removes client-only fields and caps max_tokens
  * @param {Object} payload - Request payload
  * @returns {Object} Sanitized payload
  */
-function sanitizeOutgoingPayload(payload) {
-    const sanitized = { ...payload };
+function sanitizeOutgoingPayload(payload: RequestPayload): RequestPayload {
+    const sanitized: RequestPayload = { ...payload };
     let changed = false;
     // Remove client-only fields
     for (const field of CLIENT_ONLY_BODY_FIELDS) {
@@ -511,10 +596,9 @@ function sanitizeOutgoingPayload(payload) {
             promptId: generatePromptId(),
         };
         changed = true;
-    }
-    else if (typeof sanitized.metadata === "object" && sanitized.metadata !== null) {
+    } else if (typeof sanitized.metadata === "object" && sanitized.metadata !== null) {
         // Deep-copy metadata to avoid mutating the caller's object under concurrency
-        const meta = { ...sanitized.metadata };
+        const meta = { ...(sanitized.metadata as Record<string, unknown>) };
         sanitized.metadata = meta;
         if (!meta.sessionId) {
             meta.sessionId = SESSION_ID;
@@ -527,14 +611,15 @@ function sanitizeOutgoingPayload(payload) {
     }
     return changed ? sanitized : payload;
 }
+
 /**
  * Creates degraded payload for quota error recovery
  * Removes tools and reduces max_tokens to 1024
  * @param {Object} payload - Original payload
  * @returns {Object|null} Degraded payload or null if no changes needed
  */
-function createQuotaDegradedPayload(payload) {
-    const degraded = { ...payload };
+function createQuotaDegradedPayload(payload: RequestPayload): RequestPayload | null {
+    const degraded: RequestPayload = { ...payload };
     let changed = false;
     // Remove tool-related fields
     if ("tools" in degraded) {
@@ -569,64 +654,66 @@ function createQuotaDegradedPayload(payload) {
     }
     return changed ? degraded : null;
 }
+
 /**
  * Checks if response text contains insufficientQuota error
  * @param {string} text - Response body text
  * @returns {boolean} True if insufficient quota error
  */
-function isInsufficientQuota(text) {
+function isInsufficientQuota(text: string): boolean {
     if (!text) {
         return false;
     }
     try {
-        const parsed = JSON.parse(text);
+        const parsed = JSON.parse(text) as { error?: { code?: unknown } };
         const errorCode = parsed?.error?.code;
         return typeof errorCode === "string" && errorCode.toLowerCase() === "insufficient_quota";
-    }
-    catch (_error) {
+    } catch (_error: unknown) {
         return text.toLowerCase().includes("insufficient_quota");
     }
 }
+
 /**
  * Extracts text content from message (handles string or array format)
  * @param {string|Array} content - Message content
  * @returns {string} Extracted text
  */
-function extractMessageText(content) {
+function extractMessageText(content: unknown): string {
     if (typeof content === "string") {
         return content.trim();
     }
     if (!Array.isArray(content)) {
         return "";
     }
-    return content.map((part) => {
+    return (content as unknown[]).map((part) => {
         if (typeof part === "string") {
             return part;
         }
-        if (part && typeof part === "object" && typeof part.text === "string") {
-            return part.text;
+        if (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string") {
+            return (part as { text: string }).text;
         }
         return "";
     }).filter(Boolean).join("\n").trim();
 }
+
 /**
  * Checks whether content contains non-text parts
  * @param {*} content - Message content
  * @returns {boolean} True if any non-text part is present
  */
-function hasNonTextContentPart(content) {
+function hasNonTextContentPart(content: unknown): boolean {
     if (typeof content === "string") {
         return false;
     }
     if (Array.isArray(content)) {
-        return content.some((part) => {
+        return (content as unknown[]).some((part) => {
             if (typeof part === "string") {
                 return false;
             }
             if (!part || typeof part !== "object") {
                 return true;
             }
-            const p = part;
+            const p = part as { text?: unknown; type?: unknown };
             if (typeof p.text === "string") {
                 return false;
             }
@@ -638,33 +725,35 @@ function hasNonTextContentPart(content) {
         });
     }
     if (content && typeof content === "object") {
-        return typeof content.text !== "string";
+        return typeof (content as { text?: unknown }).text !== "string";
     }
     return false;
 }
+
 /**
  * Checks whether payload contains any multimodal message content
  * @param {Object} payload - Request payload
  * @returns {boolean} True if payload contains non-text message parts
  */
-function payloadContainsNonTextMessages(payload) {
-    const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+function payloadContainsNonTextMessages(payload: RequestPayload | null): boolean {
+    const messages = Array.isArray(payload?.messages) ? payload!.messages : [];
     for (const message of messages) {
-        if (hasNonTextContentPart(message?.content)) {
+        if (hasNonTextContentPart((message as { content?: unknown })?.content)) {
             return true;
         }
     }
     return false;
 }
+
 /**
  * Builds prompt text from chat messages for CLI fallback
  * @param {Object} payload - Request payload with messages
  * @returns {string} Prompt text for qwen CLI
  */
-function buildQwenCliPrompt(payload) {
-    const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+function buildQwenCliPrompt(payload: RequestPayload | null): string {
+    const messages = Array.isArray(payload?.messages) ? payload!.messages : [];
     for (let index = messages.length - 1; index >= 0; index -= 1) {
-        const message = messages[index];
+        const message = messages[index] as { role?: unknown; content?: unknown } | null;
         if (message?.role !== "user") {
             continue;
         }
@@ -674,7 +763,7 @@ function buildQwenCliPrompt(payload) {
         }
     }
     const merged = messages.slice(-6).map((message) => {
-        const msg = message;
+        const msg = message as { role?: unknown; content?: unknown } | null;
         const text = extractMessageText(msg?.content);
         if (!text) {
             return "";
@@ -684,12 +773,13 @@ function buildQwenCliPrompt(payload) {
     }).filter(Boolean).join("\n\n");
     return merged || "Please respond to the latest user request.";
 }
+
 /**
  * Parses qwen CLI JSON output events
  * @param {string} rawOutput - Raw CLI output
  * @returns {Array|null} Parsed events or null
  */
-function parseQwenCliEvents(rawOutput) {
+function parseQwenCliEvents(rawOutput: string): unknown[] | null {
     const trimmed = rawOutput.trim();
     if (!trimmed) {
         return null;
@@ -702,38 +792,38 @@ function parseQwenCliEvents(rawOutput) {
     }
     for (const candidate of candidates) {
         try {
-            const parsed = JSON.parse(candidate);
+            const parsed = JSON.parse(candidate) as unknown;
             if (Array.isArray(parsed)) {
-                return parsed;
+                return parsed as unknown[];
             }
-        }
-        catch (_error) {
+        } catch (_error: unknown) {
             // ignore
         }
     }
     return null;
 }
+
 /**
  * Extracts response text from CLI events
  * @param {Array} events - Parsed CLI events
  * @returns {string|null} Extracted text or null
  */
-function extractQwenCliText(events) {
+function extractQwenCliText(events: unknown[]): string | null {
     for (let index = events.length - 1; index >= 0; index -= 1) {
-        const event = events[index];
-        if (event?.type === "result" && typeof event.result === "string" && event.result.trim()) {
-            return event.result.trim();
+        const event = events[index] as { type?: unknown; result?: unknown } | null;
+        if (event?.type === "result" && typeof event.result === "string" && (event.result as string).trim()) {
+            return (event.result as string).trim();
         }
     }
     for (let index = events.length - 1; index >= 0; index -= 1) {
-        const event = events[index];
+        const event = events[index] as { message?: { content?: unknown } } | null;
         const content = event?.message?.content;
         if (!Array.isArray(content)) {
             continue;
         }
-        const text = content.map((part) => {
-            if (part && typeof part === "object" && typeof part.text === "string") {
-                return part.text;
+        const text = (content as unknown[]).map((part) => {
+            if (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string") {
+                return (part as { text: string }).text;
             }
             return "";
         }).filter(Boolean).join("\n").trim();
@@ -743,14 +833,16 @@ function extractQwenCliText(events) {
     }
     return null;
 }
+
 /**
  * Creates SSE formatted chunk for streaming responses
  * @param {Object} data - Data to stringify and send
  * @returns {string} SSE formatted string chunk
  */
-function createSseResponseChunk(data) {
+function createSseResponseChunk(data: unknown): string {
     return `data: ${JSON.stringify(data)}\n\n`;
 }
+
 /**
  * Creates Response object matching OpenAI completion format
  * Handles both streaming (SSE) and non-streaming responses
@@ -760,7 +852,12 @@ function createSseResponseChunk(data) {
  * @param {boolean} streamMode - Whether to return streaming response
  * @returns {Response} Formatted completion response
  */
-function makeQwenCliCompletionResponse(model, content, context, streamMode) {
+function makeQwenCliCompletionResponse(
+    model: string,
+    content: string,
+    context: RequestContext,
+    streamMode: boolean,
+): Response {
     if (LOGGING_ENABLED) {
         logInfo("Qwen CLI fallback returned completion", {
             request_id: context.requestId,
@@ -846,6 +943,7 @@ function makeQwenCliCompletionResponse(model, content, context, streamMode) {
         },
     });
 }
+
 /**
  * Executes qwen CLI as fallback when API quota is exceeded
  * @param {Object} payload - Original request payload
@@ -853,8 +951,13 @@ function makeQwenCliCompletionResponse(model, content, context, streamMode) {
  * @param {AbortSignal} [abortSignal] - Abort controller signal
  * @returns {Promise<{ ok: boolean, response?: Response, reason?: string, stdout?: string, stderr?: string }>} Fallback execution result
  */
-async function runQwenCliFallback(payload, context, abortSignal) {
-    const model = typeof payload?.model === "string" && payload.model.length > 0 ? payload.model : "coder-model";
+async function runQwenCliFallback(
+    payload: RequestPayload | null,
+    context: RequestContext,
+    abortSignal?: AbortSignal | null,
+): Promise<CliFallbackResult> {
+    const model =
+        typeof payload?.model === "string" && payload.model.length > 0 ? payload.model : "coder-model";
     const streamMode = payload?.stream === true;
     if (payloadContainsNonTextMessages(payload)) {
         if (LOGGING_ENABLED) {
@@ -886,14 +989,14 @@ async function runQwenCliFallback(payload, context, abortSignal) {
             reason: "cli_shell_execution_blocked_for_security",
         };
     }
-    return await new Promise((resolve) => {
+    return await new Promise<CliFallbackResult>((resolve) => {
         let settled = false;
         let stdout = "";
         let stderr = "";
-        let timer = null;
-        let child = undefined;
-        let abortHandler = undefined;
-        const finalize = (result) => {
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        let child: ReturnType<typeof spawn> | undefined = undefined;
+        let abortHandler: (() => void) | undefined = undefined;
+        const finalize = (result: CliFallbackResult) => {
             if (settled) {
                 return;
             }
@@ -919,8 +1022,7 @@ async function runQwenCliFallback(payload, context, abortSignal) {
                 windowsHide: true,
                 stdio: ["ignore", "pipe", "pipe"],
             });
-        }
-        catch (error) {
+        } catch (error: unknown) {
             finalize({
                 ok: false,
                 reason: `cli_spawn_throw:${error instanceof Error ? error.message : String(error)}`,
@@ -931,8 +1033,7 @@ async function runQwenCliFallback(payload, context, abortSignal) {
             abortHandler = () => {
                 try {
                     child?.kill();
-                }
-                catch (_killError) {
+                } catch (_killError: unknown) {
                     // ignore
                 }
                 finalize({
@@ -944,9 +1045,8 @@ async function runQwenCliFallback(payload, context, abortSignal) {
         }
         timer = setTimeout(() => {
             try {
-                child.kill();
-            }
-            catch (_killError) {
+                child!.kill();
+            } catch (_killError: unknown) {
                 // ignore
             }
             finalize({
@@ -954,19 +1054,19 @@ async function runQwenCliFallback(payload, context, abortSignal) {
                 reason: "cli_timeout",
             });
         }, CLI_FALLBACK_TIMEOUT_MS);
-        child.stdout.on("data", (chunk) => {
+        child.stdout!.on("data", (chunk: Buffer) => {
             stdout = appendLimitedText(stdout, chunk.toString());
         });
-        child.stderr.on("data", (chunk) => {
+        child.stderr!.on("data", (chunk: Buffer) => {
             stderr = appendLimitedText(stderr, chunk.toString());
         });
-        child.on("error", (error) => {
+        child.on("error", (error: Error) => {
             finalize({
                 ok: false,
                 reason: `cli_spawn_error:${error instanceof Error ? error.message : String(error)}`,
             });
         });
-        child.on("close", (exitCode) => {
+        child.on("close", (exitCode: number | null) => {
             const events = parseQwenCliEvents(stdout);
             const content = events ? extractQwenCliText(events) : null;
             if (content) {
@@ -985,6 +1085,7 @@ async function runQwenCliFallback(payload, context, abortSignal) {
         });
     });
 }
+
 /**
  * Creates Response object for quota/rate limit errors
  * @param {string} text - Response body text
@@ -992,7 +1093,7 @@ async function runQwenCliFallback(payload, context, abortSignal) {
  * @param {Object} context - Request context for logging
  * @returns {Response} Formatted error response
  */
-function makeQuotaFailFastResponse(text, sourceHeaders, context) {
+function makeQuotaFailFastResponse(text: string, sourceHeaders: HeadersInit, context: RequestContext): Response {
     const headers = new Headers(sourceHeaders);
     headers.set("content-type", "application/json");
     const body = text || JSON.stringify({
@@ -1017,35 +1118,36 @@ function makeQuotaFailFastResponse(text, sourceHeaders, context) {
         headers,
     });
 }
+
 /**
  * Performs fetch request with timeout protection
  * @param {Request|string} input - Fetch input
  * @param {RequestInit} requestInit - Fetch options
  * @returns {Promise<Response>} Fetch response
  */
-async function sendWithTimeout(input, requestInit) {
+async function sendWithTimeout(input: string, requestInit: RequestInit): Promise<Response> {
     const composed = createRequestSignalWithTimeout(requestInit.signal, CHAT_REQUEST_TIMEOUT_MS);
     try {
         return await fetch(input, {
             ...requestInit,
             signal: composed.signal,
         });
-    }
-    finally {
+    } finally {
         composed.cleanup();
     }
 }
+
 /**
  * Injects required DashScope OAuth headers into fetch request
  * Ensures compatibility even if OpenCode doesn't call chat.headers hook
  * @param {RequestInit} requestInit - Fetch options to modify
  */
-function applyDashScopeHeaders(requestInit) {
+function applyDashScopeHeaders(requestInit: RequestInit): void {
     // Ensure required DashScope OAuth headers are always present.
     // This mirrors qwen-code (DashScopeOpenAICompatibleProvider.buildHeaders) behavior.
     // NOTE: We intentionally do this in the fetch layer so it works even when
     // OpenCode does not call the `chat.headers` hook (older versions / API mismatch).
-    const headersToApply = {
+    const headersToApply: Record<string, string> = {
         "X-DashScope-AuthType": PORTAL_HEADERS.AUTH_TYPE_VALUE,
         "X-DashScope-CacheControl": "enable",
         "User-Agent": PLUGIN_USER_AGENT,
@@ -1064,22 +1166,25 @@ function applyDashScopeHeaders(requestInit) {
         return;
     }
     if (Array.isArray(requestInit.headers)) {
-        const existing = new Set(requestInit.headers.map(([name]) => String(name).toLowerCase()));
+        const existing = new Set((requestInit.headers as [string, string][]).map(([name]) => String(name).toLowerCase()));
         for (const [key, value] of Object.entries(headersToApply)) {
             if (!existing.has(key.toLowerCase())) {
-                requestInit.headers.push([key, value]);
+                (requestInit.headers as [string, string][]).push([key, value]);
             }
         }
         return;
     }
     // Plain object
-    const existingKeys = new Set(Object.keys(requestInit.headers).map((k) => k.toLowerCase()));
+    const existingKeys = new Set(
+        Object.keys(requestInit.headers as Record<string, string>).map((k) => k.toLowerCase())
+    );
     for (const [key, value] of Object.entries(headersToApply)) {
         if (!existingKeys.has(key.toLowerCase())) {
-            requestInit.headers[key] = value;
+            (requestInit.headers as Record<string, string>)[key] = value;
         }
     }
 }
+
 /**
  * Custom fetch wrapper for OpenCode SDK
  * Handles token limits, DashScope headers, retries, and quota error fallback
@@ -1087,7 +1192,7 @@ function applyDashScopeHeaders(requestInit) {
  * @param {RequestInit} [init] - Fetch options
  * @returns {Promise<Response>} API response or fallback response
  */
-async function failFastFetch(input, init, initialAccountId) {
+async function failFastFetch(input: Request | string, init?: RequestInit, initialAccountId?: string | null): Promise<Response> {
     const normalized = await normalizeFetchInvocation(input, init);
     let requestInput = normalized.requestInput;
     const requestInit = normalized.requestInit;
@@ -1097,7 +1202,7 @@ async function failFastFetch(input, init, initialAccountId) {
     const sourceSignal = requestInit.signal;
     const rawPayload = parseJsonRequestBody(requestInit);
     const sessionID = typeof rawPayload?.sessionID === "string" ? rawPayload.sessionID : undefined;
-    let payload = rawPayload;
+    let payload: RequestPayload | null = rawPayload;
     if (payload) {
         // Ensure we never exceed DashScope model output limits.
         const capped = capPayloadMaxTokens(payload);
@@ -1111,7 +1216,7 @@ async function failFastFetch(input, init, initialAccountId) {
             applyJsonRequestBody(requestInit, payload);
         }
     }
-    const context = {
+    const context: RequestContext = {
         requestId: randomUUID(),
         sessionID,
         modelID: typeof payload?.model === "string" ? payload.model : undefined,
@@ -1124,8 +1229,9 @@ async function failFastFetch(input, init, initialAccountId) {
             modelID: context.modelID,
             accountID: context.accountID,
             max_tokens: typeof payload?.max_tokens === "number" ? payload.max_tokens : undefined,
-            max_completion_tokens: typeof payload?.max_completion_tokens === "number" ? payload.max_completion_tokens : undefined,
-            message_count: Array.isArray(payload?.messages) ? payload.messages.length : undefined,
+            max_completion_tokens:
+                typeof payload?.max_completion_tokens === "number" ? payload.max_completion_tokens : undefined,
+            message_count: Array.isArray(payload?.messages) ? payload!.messages.length : undefined,
             stream: payload?.stream === true,
         });
     }
@@ -1157,7 +1263,7 @@ async function failFastFetch(input, init, initialAccountId) {
                                 await markOAuthAccountQuotaExhausted(context.accountID, "insufficient_quota");
                                 const switched = await switchToNextHealthyOAuthAccount([context.accountID]);
                                 if (switched?.accessToken) {
-                                    const rotatedInit = { ...requestInit };
+                                    const rotatedInit: RequestInit = { ...requestInit };
                                     requestInput = rewriteRequestBaseUrl(requestInput, switched.resourceUrl ?? "");
                                     applyAuthorizationHeader(rotatedInit, switched.accessToken);
                                     applyAuthorizationHeader(requestInit, switched.accessToken);
@@ -1177,21 +1283,23 @@ async function failFastFetch(input, init, initialAccountId) {
                                         continue;
                                     }
                                 }
-                            }
-                            catch (switchError) {
+                            } catch (switchError: unknown) {
                                 logWarn("Failed to switch OAuth account after insufficient_quota", switchError);
                             }
                         }
                         const degradedPayload = createQuotaDegradedPayload(payload);
                         if (degradedPayload) {
-                            const fallbackInit = { ...requestInit };
+                            const fallbackInit: RequestInit = { ...requestInit };
                             applyJsonRequestBody(fallbackInit, degradedPayload);
                             if (LOGGING_ENABLED) {
-                                logWarn(`Retrying with degraded payload after ${response.status} insufficient_quota, attempt ${retryAttempt + 2}/${MAX_REQUEST_RETRIES + 1}`, {
-                                    request_id: context.requestId,
-                                    sessionID: context.sessionID,
-                                    modelID: context.modelID,
-                                });
+                                logWarn(
+                                    `Retrying with degraded payload after ${response.status} insufficient_quota, attempt ${retryAttempt + 2}/${MAX_REQUEST_RETRIES + 1}`,
+                                    {
+                                        request_id: context.requestId,
+                                        sessionID: context.sessionID,
+                                        modelID: context.modelID,
+                                    },
+                                );
                             }
                             response = await sendWithTimeout(requestInput, fallbackInit);
                             if (retryAttempt < MAX_REQUEST_RETRIES) {
@@ -1201,9 +1309,13 @@ async function failFastFetch(input, init, initialAccountId) {
                             if (ENABLE_CLI_FALLBACK) {
                                 await cliFallbackSemaphore.acquire();
                                 try {
-                                    const cliFallback = await runQwenCliFallback(payload, context, sourceSignal);
+                                    const cliFallback = await runQwenCliFallback(
+                                        payload,
+                                        context,
+                                        sourceSignal as AbortSignal | null | undefined,
+                                    );
                                     if (cliFallback.ok) {
-                                        return cliFallback.response;
+                                        return cliFallback.response!;
                                     }
                                     if (cliFallback.reason === "cli_aborted") {
                                         return makeFailFastErrorResponse(400, "request_aborted", "Qwen request was aborted");
@@ -1217,8 +1329,7 @@ async function failFastFetch(input, init, initialAccountId) {
                                             stderr: cliFallback.stderr,
                                         });
                                     }
-                                }
-                                finally {
+                                } finally {
                                     cliFallbackSemaphore.release();
                                 }
                             }
@@ -1227,9 +1338,13 @@ async function failFastFetch(input, init, initialAccountId) {
                         if (ENABLE_CLI_FALLBACK) {
                             await cliFallbackSemaphore.acquire();
                             try {
-                                const cliFallback = await runQwenCliFallback(payload, context, sourceSignal);
+                                const cliFallback = await runQwenCliFallback(
+                                    payload,
+                                    context,
+                                    sourceSignal as AbortSignal | null | undefined,
+                                );
                                 if (cliFallback.ok) {
-                                    return cliFallback.response;
+                                    return cliFallback.response!;
                                 }
                                 if (cliFallback.reason === "cli_aborted") {
                                     return makeFailFastErrorResponse(400, "request_aborted", "Qwen request was aborted");
@@ -1243,8 +1358,7 @@ async function failFastFetch(input, init, initialAccountId) {
                                         stderr: cliFallback.stderr,
                                     });
                                 }
-                            }
-                            finally {
+                            } finally {
                                 cliFallbackSemaphore.release();
                             }
                         }
@@ -1253,11 +1367,14 @@ async function failFastFetch(input, init, initialAccountId) {
                 }
                 if (retryAttempt < MAX_REQUEST_RETRIES) {
                     if (LOGGING_ENABLED) {
-                        logWarn(`Retrying after ${response.status}, attempt ${retryAttempt + 2}/${MAX_REQUEST_RETRIES + 1}`, {
-                            request_id: context.requestId,
-                            sessionID: context.sessionID,
-                            modelID: context.modelID,
-                        });
+                        logWarn(
+                            `Retrying after ${response.status}, attempt ${retryAttempt + 2}/${MAX_REQUEST_RETRIES + 1}`,
+                            {
+                                request_id: context.requestId,
+                                sessionID: context.sessionID,
+                                modelID: context.modelID,
+                            },
+                        );
                     }
                     // Exponential backoff with ±30% jitter — matches CLI retry pattern
                     const retryDelay = calculateRetryDelay(retryAttempt);
@@ -1272,21 +1389,24 @@ async function failFastFetch(input, init, initialAccountId) {
             return response;
         }
         return response;
-    }
-    catch (error) {
+    } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
         const lowered = message.toLowerCase();
         if (lowered.includes("aborted") || lowered.includes("timeout")) {
             logWarn("Qwen request timeout (fail-fast)", { timeoutMs: CHAT_REQUEST_TIMEOUT_MS, message });
-            return makeFailFastErrorResponse(400, "request_timeout", `Qwen request timed out after ${CHAT_REQUEST_TIMEOUT_MS}ms`);
+            return makeFailFastErrorResponse(
+                400,
+                "request_timeout",
+                `Qwen request timed out after ${CHAT_REQUEST_TIMEOUT_MS}ms`,
+            );
         }
         logError("Qwen upstream fetch failed", { message });
         return makeFailFastErrorResponse(400, "upstream_unavailable", "Qwen upstream request failed");
-    }
-    finally {
+    } finally {
         requestSemaphore.release();
     }
 }
+
 /**
  * Get valid access token from SDK auth state, refresh if expired.
  * Uses getAuth() from SDK instead of reading file directly.
@@ -1294,7 +1414,9 @@ async function failFastFetch(input, init, initialAccountId) {
  * @param {Function} getAuth - Function to get auth state from SDK
  * @returns {Promise<{ accessToken: string, resourceUrl?: string, accountId?: string }|null>} Access token state or null
  */
-async function getValidAccessToken(getAuth) {
+async function getValidAccessToken(
+    getAuth: () => Promise<import("@opencode-ai/sdk").Auth>,
+): Promise<{ accessToken: string; resourceUrl?: string; accountId?: string } | null> {
     const activeOAuthAccount = await getActiveOAuthAccount({ allowExhausted: false });
     if (activeOAuthAccount?.accessToken) {
         return {
@@ -1314,29 +1436,27 @@ async function getValidAccessToken(getAuth) {
     if (!auth || auth.type !== "oauth") {
         return null;
     }
-    let accessToken = auth.access;
-    let resourceUrl = undefined;
+    let accessToken: string | undefined = auth.access;
+    let resourceUrl: string | undefined = undefined;
     // Refresh if expired (using same buffer as auth.ts TOKEN_REFRESH_BUFFER_MS)
     if (accessToken && auth.expires && Date.now() > auth.expires - TOKEN_REFRESH_BUFFER_MS && auth.refresh) {
         try {
             const refreshResult = await refreshAccessToken(auth.refresh);
             if (refreshResult.type === "success") {
-                accessToken = refreshResult.access;
-                resourceUrl = refreshResult.resourceUrl;
+                accessToken = (refreshResult as TokenSuccess).access;
+                resourceUrl = (refreshResult as TokenSuccess).resourceUrl;
                 saveToken(refreshResult);
                 await upsertOAuthAccount(refreshResult, {
                     setActive: false,
                     accountId: activeOAuthAccount?.accountId,
                 });
-            }
-            else {
+            } else {
                 if (LOGGING_ENABLED) {
                     logError("Token refresh failed");
                 }
                 accessToken = undefined;
             }
-        }
-        catch (e) {
+        } catch (e: unknown) {
             if (LOGGING_ENABLED) {
                 logError("Token refresh error:", e);
             }
@@ -1345,7 +1465,7 @@ async function getValidAccessToken(getAuth) {
     }
     if (auth.access && auth.refresh) {
         try {
-            const sdkToken = {
+            const sdkToken: TokenSuccess = {
                 type: "success",
                 access: accessToken || auth.access,
                 refresh: auth.refresh,
@@ -1357,8 +1477,7 @@ async function getValidAccessToken(getAuth) {
                 setActive: false,
                 accountId: activeOAuthAccount?.accountId,
             });
-        }
-        catch (e) {
+        } catch (e: unknown) {
             logWarn("Failed to bootstrap .qwen token from SDK auth state:", e);
         }
     }
@@ -1370,12 +1489,13 @@ async function getValidAccessToken(getAuth) {
         resourceUrl,
     };
 }
+
 /**
  * Get base URL from token stored on disk (resource_url).
  * Falls back to DashScope compatible-mode if not available.
  * @returns {string} DashScope API base URL
  */
-function getBaseUrl(resourceUrl) {
+function getBaseUrl(resourceUrl?: string): string {
     if (typeof resourceUrl === "string" && resourceUrl.length > 0) {
         return getApiBaseUrl(resourceUrl);
     }
@@ -1384,16 +1504,16 @@ function getBaseUrl(resourceUrl) {
         if (stored?.resource_url) {
             return getApiBaseUrl(stored.resource_url);
         }
-    }
-    catch (e) {
+    } catch (e: unknown) {
         logWarn("Failed to load stored token for baseURL, using default:", e);
     }
     return getApiBaseUrl();
 }
+
 /**
  * Alibaba Qwen OAuth authentication plugin for opencode
  * Integrates Qwen OAuth device flow and API handling into opencode SDK
- *
+ * 
  * @param {*} _input - Plugin initialization input
  * @returns {Promise<Object>} Plugin configuration and hooks
  *
@@ -1405,7 +1525,7 @@ function getBaseUrl(resourceUrl) {
  * }
  * ```
  */
-export const QwenAuthPlugin = async (_input) => {
+export const QwenAuthPlugin: Plugin = async (_input) => {
     return {
         auth: {
             provider: PROVIDER_ID,
@@ -1417,13 +1537,11 @@ export const QwenAuthPlugin = async (_input) => {
                 // Zero cost for OAuth models (free)
                 if (provider?.models) {
                     for (const model of Object.values(provider.models)) {
-                        if (model)
-                            model.cost = { input: 0, output: 0 };
+                        if (model) (model as { cost?: { input: number; output: number } }).cost = { input: 0, output: 0 };
                     }
                 }
                 const tokenState = await getValidAccessToken(getAuth);
-                if (!tokenState?.accessToken)
-                    return {};
+                if (!tokenState?.accessToken) return {} as Record<string, unknown>;
                 const currentAccountId = tokenState.accountId || null;
                 const baseURL = getBaseUrl(tokenState.resourceUrl);
                 if (LOGGING_ENABLED) {
@@ -1434,7 +1552,7 @@ export const QwenAuthPlugin = async (_input) => {
                     baseURL,
                     timeout: CHAT_REQUEST_TIMEOUT_MS,
                     maxRetries: CHAT_MAX_RETRIES,
-                    fetch: (input, init) => failFastFetch(input, init, currentAccountId),
+                    fetch: (input: RequestInfo | URL, init?: RequestInit) => failFastFetch(input as Request | string, init, currentAccountId),
                 };
             },
             methods: [
@@ -1459,7 +1577,7 @@ export const QwenAuthPlugin = async (_input) => {
                         const verificationUrl = deviceAuth.verification_uri_complete || deviceAuth.verification_uri;
                         return {
                             url: verificationUrl,
-                            method: "auto",
+                            method: "auto" as const,
                             instructions: AUTH_LABELS.INSTRUCTIONS,
                             callback: async () => {
                                 // Poll for token
@@ -1477,7 +1595,7 @@ export const QwenAuthPlugin = async (_input) => {
                                         await upsertOAuthAccount(result, { setActive: true });
                                         // Return to SDK to save auth state
                                         return {
-                                            type: "success",
+                                            type: "success" as const,
                                             access: result.access,
                                             refresh: result.refresh,
                                             expires: result.expires,
@@ -1499,28 +1617,28 @@ export const QwenAuthPlugin = async (_input) => {
                                                 error: result.error,
                                                 description: result.description,
                                             });
-                                            return { type: "failed" };
+                                            return { type: "failed" as const };
                                         }
                                         consecutivePollFailures += 1;
                                         logWarn(`OAuth token polling failed (${consecutivePollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`);
                                         if (consecutivePollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
                                             console.error("[qwen-oauth-plugin] OAuth token polling failed repeatedly");
-                                            return { type: "failed" };
+                                            return { type: "failed" as const };
                                         }
                                         continue;
                                     }
                                     if (result.type === "denied") {
                                         console.error("[qwen-oauth-plugin] Device authorization was denied");
-                                        return { type: "failed" };
+                                        return { type: "failed" as const };
                                     }
                                     if (result.type === "expired") {
                                         console.error("[qwen-oauth-plugin] Device authorization code expired");
-                                        return { type: "failed" };
+                                        return { type: "failed" as const };
                                     }
-                                    return { type: "failed" };
+                                    return { type: "failed" as const };
                                 }
                                 console.error("[qwen-oauth-plugin] Device authorization timed out");
-                                return { type: "failed" };
+                                return { type: "failed" as const };
                             },
                         };
                     },
@@ -1544,7 +1662,7 @@ export const QwenAuthPlugin = async (_input) => {
                         const verificationUrl = deviceAuth.verification_uri_complete || deviceAuth.verification_uri;
                         return {
                             url: verificationUrl,
-                            method: "auto",
+                            method: "auto" as const,
                             instructions: "Login with a DIFFERENT Qwen account to add it as backup for auto-switch.",
                             callback: async () => {
                                 let pollInterval = (deviceAuth.interval || 5) * 1000;
@@ -1570,18 +1688,19 @@ export const QwenAuthPlugin = async (_input) => {
                                                 healthyAccounts: savedAccount?.healthyAccountCount,
                                             });
                                         }
-                                        console.log(`[Add Account] Success! Account added. Total accounts: ${savedAccount?.totalAccountCount || "?"}`);
+                                        console.log(
+                                            `[Add Account] Success! Account added. Total accounts: ${savedAccount?.totalAccountCount || "?"}`,
+                                        );
                                         // Khoi phuc legacy token file (oauth_creds.json) ve active account
                                         // de loader doc dung token cua account chinh, khong dung token account moi
                                         try {
                                             await getActiveOAuthAccount({ allowExhausted: true });
                                             // getActiveOAuthAccount auto-syncs active account token to oauth_creds.json
-                                        }
-                                        catch (_restoreError) {
+                                        } catch (_restoreError: unknown) {
                                             logWarn("Failed to restore active account after adding new account");
                                         }
                                         return {
-                                            type: "success",
+                                            type: "success" as const,
                                             access: result.access,
                                             refresh: result.refresh,
                                             expires: result.expires,
@@ -1603,28 +1722,34 @@ export const QwenAuthPlugin = async (_input) => {
                                                 error: result.error,
                                                 description: result.description,
                                             });
-                                            return { type: "failed" };
+                                            return { type: "failed" as const };
                                         }
                                         consecutivePollFailures += 1;
-                                        logWarn(`OAuth token polling failed (add-account) (${consecutivePollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`);
+                                        logWarn(
+                                            `OAuth token polling failed (add-account) (${consecutivePollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`,
+                                        );
                                         if (consecutivePollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
-                                            console.error("[qwen-oauth-plugin] OAuth token polling failed repeatedly (add-account)");
-                                            return { type: "failed" };
+                                            console.error(
+                                                "[qwen-oauth-plugin] OAuth token polling failed repeatedly (add-account)",
+                                            );
+                                            return { type: "failed" as const };
                                         }
                                         continue;
                                     }
                                     if (result.type === "denied") {
                                         console.error("[qwen-oauth-plugin] Device authorization was denied (add-account)");
-                                        return { type: "failed" };
+                                        return { type: "failed" as const };
                                     }
                                     if (result.type === "expired") {
-                                        console.error("[qwen-oauth-plugin] Device authorization code expired (add-account)");
-                                        return { type: "failed" };
+                                        console.error(
+                                            "[qwen-oauth-plugin] Device authorization code expired (add-account)",
+                                        );
+                                        return { type: "failed" as const };
                                     }
-                                    return { type: "failed" };
+                                    return { type: "failed" as const };
                                 }
                                 console.error("[qwen-oauth-plugin] Device authorization timed out (add-account)");
-                                return { type: "failed" };
+                                return { type: "failed" as const };
                             },
                         };
                     },
@@ -1637,7 +1762,7 @@ export const QwenAuthPlugin = async (_input) => {
          * coder-model and vision-model (according to QWEN_OAUTH_ALLOWED_MODELS from original CLI)
          */
         config: async (config) => {
-            const providers = config.provider || {};
+            const providers = (config as unknown as { provider?: Record<string, unknown> }).provider || {};
             providers[PROVIDER_ID] = {
                 npm: "@ai-sdk/openai-compatible",
                 name: "Qwen Code",
@@ -1672,21 +1797,26 @@ export const QwenAuthPlugin = async (_input) => {
                     },
                 },
             };
-            config.provider = providers;
+            (config as unknown as { provider?: Record<string, unknown> }).provider = providers;
         },
         /**
          * Apply dynamic chat parameters before sending request
          * Ensures tokens and timeouts don't exceed plugin limits
-         *
+         * 
          * @param {*} input - Original chat request parameters
          * @param {*} output - Final payload to be sent
          */
         "chat.params": async (input, output) => {
             try {
-                const out = output;
+                const out = output as Record<string, unknown> & {
+                    options?: Record<string, unknown>;
+                    max_tokens?: number;
+                    max_completion_tokens?: number;
+                    maxTokens?: number;
+                };
                 out.options = out.options || {};
                 out.options.maxRetries = CHAT_MAX_RETRIES;
-                if (typeof out.options.timeout !== "number" || out.options.timeout > CHAT_REQUEST_TIMEOUT_MS) {
+                if (typeof out.options.timeout !== "number" || (out.options.timeout as number) > CHAT_REQUEST_TIMEOUT_MS) {
                     out.options.timeout = CHAT_REQUEST_TIMEOUT_MS;
                 }
                 if (typeof out.max_tokens === "number" && out.max_tokens > CHAT_MAX_TOKENS_CAP) {
@@ -1698,20 +1828,26 @@ export const QwenAuthPlugin = async (_input) => {
                 if (typeof out.maxTokens === "number" && out.maxTokens > CHAT_MAX_TOKENS_CAP) {
                     out.maxTokens = CHAT_MAX_TOKENS_CAP;
                 }
-                if (typeof out.options.max_tokens === "number" &&
-                    out.options.max_tokens > CHAT_MAX_TOKENS_CAP) {
+                if (
+                    typeof out.options.max_tokens === "number" &&
+                    (out.options.max_tokens as number) > CHAT_MAX_TOKENS_CAP
+                ) {
                     out.options.max_tokens = CHAT_MAX_TOKENS_CAP;
                 }
-                if (typeof out.options.max_completion_tokens === "number" &&
-                    out.options.max_completion_tokens > CHAT_MAX_TOKENS_CAP) {
+                if (
+                    typeof out.options.max_completion_tokens === "number" &&
+                    (out.options.max_completion_tokens as number) > CHAT_MAX_TOKENS_CAP
+                ) {
                     out.options.max_completion_tokens = CHAT_MAX_TOKENS_CAP;
                 }
-                if (typeof out.options.maxTokens === "number" &&
-                    out.options.maxTokens > CHAT_MAX_TOKENS_CAP) {
+                if (
+                    typeof out.options.maxTokens === "number" &&
+                    (out.options.maxTokens as number) > CHAT_MAX_TOKENS_CAP
+                ) {
                     out.options.maxTokens = CHAT_MAX_TOKENS_CAP;
                 }
                 if (LOGGING_ENABLED) {
-                    const inp = input;
+                    const inp = input as { sessionID?: string; model?: { id?: string } };
                     logInfo("Applied chat.params hotfix", {
                         sessionID: inp?.sessionID,
                         modelID: inp?.model?.id,
@@ -1722,8 +1858,7 @@ export const QwenAuthPlugin = async (_input) => {
                         maxTokens: out.maxTokens,
                     });
                 }
-            }
-            catch (e) {
+            } catch (e: unknown) {
                 logWarn("Failed to apply chat params hotfix:", e);
             }
         },
@@ -1731,13 +1866,13 @@ export const QwenAuthPlugin = async (_input) => {
          * Send DashScope headers like original CLI.
          * X-DashScope-CacheControl: enable prompt caching, reduce token consumption.
          * X-DashScope-AuthType: specify auth method for server.
-         *
+         * 
          * @param {*} input - Original chat request parameters
          * @param {*} output - Final payload to be sent
          */
-        "chat.headers": async (input, output) => {
+        "chat.headers": async (input: unknown, output: unknown) => {
             try {
-                const out = output;
+                const out = output as Record<string, unknown> & { headers?: Record<string, string> };
                 out.headers = out.headers || {};
                 const requestId = randomUUID();
                 out.headers["X-DashScope-CacheControl"] = "enable";
@@ -1746,7 +1881,11 @@ export const QwenAuthPlugin = async (_input) => {
                 out.headers["X-DashScope-UserAgent"] = PLUGIN_USER_AGENT;
                 // NOTE: x-request-id intentionally NOT sent — official CLI does not send it on API calls
                 if (LOGGING_ENABLED) {
-                    const inp = input;
+                    const inp = input as {
+                        sessionID?: string;
+                        model?: { id?: string };
+                        provider?: { info?: { id?: string } };
+                    };
                     logInfo("Applied chat.headers", {
                         request_id: requestId,
                         sessionID: inp?.sessionID,
@@ -1754,12 +1893,11 @@ export const QwenAuthPlugin = async (_input) => {
                         providerID: inp?.provider?.info?.id,
                     });
                 }
-            }
-            catch (e) {
+            } catch (e: unknown) {
                 logWarn("Failed to set chat headers:", e);
             }
         },
     };
 };
+
 export default QwenAuthPlugin;
-//# sourceMappingURL=index.js.map
