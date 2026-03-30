@@ -11,7 +11,7 @@
  *
  * @license MIT with Usage Disclaimer (see LICENSE file)
  * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
- * @version 2.4.1
+ * @version 2.4.2
  */
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
@@ -21,8 +21,6 @@ import { PROVIDER_ID, AUTH_LABELS, DEVICE_FLOW, PORTAL_HEADERS, TOKEN_REFRESH_BU
 import { logError, logInfo, logWarn, LOGGING_ENABLED } from "./lib/logger.js";
 /** Request timeout — matches CLI's DEFAULT_TIMEOUT (120 seconds) */
 const CHAT_REQUEST_TIMEOUT_MS = 120000;
-/** Stream inactivity timeout — abort if no data chunk arrives within this window */
-const STREAM_INACTIVITY_TIMEOUT_MS = 45000;
 /** Maximum number of retry attempts for failed requests */
 const CHAT_MAX_RETRIES = 3;
 /** Output token cap for coder-model (64K tokens) */
@@ -251,35 +249,6 @@ function makeFailFastErrorResponse(status, code, message) {
         status,
         headers: { "content-type": "application/json" },
     });
-}
-/**
- * Creates AbortSignal with timeout that composes with source signal
- * Properly cleans up timers and event listeners
- * @param {AbortSignal} [sourceSignal] - Original abort signal from caller
- * @param {number} timeoutMs - Timeout in milliseconds
- * @returns {{ signal: AbortSignal, cleanup: () => void }} Composed signal and cleanup function
- */
-function createRequestSignalWithTimeout(sourceSignal, timeoutMs) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(new Error("request_timeout")), timeoutMs);
-    const onSourceAbort = () => controller.abort(sourceSignal?.reason);
-    if (sourceSignal) {
-        if (sourceSignal.aborted) {
-            controller.abort(sourceSignal.reason);
-        }
-        else {
-            sourceSignal.addEventListener("abort", onSourceAbort, { once: true });
-        }
-    }
-    return {
-        signal: controller.signal,
-        cleanup: () => {
-            clearTimeout(timeoutId);
-            if (sourceSignal) {
-                sourceSignal.removeEventListener("abort", onSourceAbort);
-            }
-        },
-    };
 }
 /**
  * Appends text chunk with size limit to prevent memory overflow
@@ -1026,103 +995,43 @@ function makeQuotaFailFastResponse(text, sourceHeaders, context) {
  * @returns {Promise<Response>} Fetch response
  */
 async function sendWithTimeout(input, requestInit) {
-    const composed = createRequestSignalWithTimeout(requestInit.signal, CHAT_REQUEST_TIMEOUT_MS);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(new Error("request_timeout")), CHAT_REQUEST_TIMEOUT_MS);
+    const sourceSignal = requestInit.signal;
+    const onSourceAbort = () => controller.abort(sourceSignal?.reason);
+    if (sourceSignal) {
+        if (sourceSignal.aborted) {
+            controller.abort(sourceSignal.reason);
+        }
+        else {
+            sourceSignal.addEventListener("abort", onSourceAbort, { once: true });
+        }
+    }
     try {
         const response = await fetch(input, {
             ...requestInit,
-            signal: composed.signal,
+            signal: controller.signal,
         });
-        // For non-streaming or error responses, cleanup immediately
-        // For streaming 200 responses, cleanup is deferred to wrapResponseWithStreamWatchdog
+        // IMPORTANT: Do NOT clearTimeout here for streaming 200 responses.
+        // The timeout keeps running, guarding the full stream body consumption.
+        // For non-2xx or bodyless responses, clear immediately.
         if (!response.ok || !response.body) {
-            composed.cleanup();
+            clearTimeout(timeoutId);
+            if (sourceSignal)
+                sourceSignal.removeEventListener("abort", onSourceAbort);
         }
-        // Attach cleanup so the caller can defer it for streaming responses
-        response.__timeoutCleanup = composed.cleanup;
+        // Note: For streaming 200 responses, the timeout remains active.
+        // When the SDK finishes reading the stream (or the timeout fires),
+        // the AbortSignal will abort the underlying connection.
+        // The timeout is our safety net against stalled streams.
         return response;
     }
     catch (error) {
-        composed.cleanup();
+        clearTimeout(timeoutId);
+        if (sourceSignal)
+            sourceSignal.removeEventListener("abort", onSourceAbort);
         throw error;
     }
-}
-/**
- * Wraps a streaming Response body with an inactivity watchdog.
- * If no data chunk arrives within STREAM_INACTIVITY_TIMEOUT_MS, the stream is aborted.
- * This prevents indefinite hangs when the server stops sending data mid-stream.
- *
- * Also cleans up the original request timeout when the stream ends or aborts.
- *
- * @param response - The original fetch Response (must have a readable body)
- * @param inactivityTimeoutMs - Max ms allowed between consecutive data chunks
- * @returns A new Response with the watchdog-wrapped body
- */
-function wrapResponseWithStreamWatchdog(response, inactivityTimeoutMs = STREAM_INACTIVITY_TIMEOUT_MS) {
-    const body = response.body;
-    if (!body) {
-        // No body to watch — clean up request timeout and return as-is
-        response.__timeoutCleanup?.();
-        return response;
-    }
-    const originalCleanup = response.__timeoutCleanup;
-    const reader = body.getReader();
-    let watchdogTimer = null;
-    let aborted = false;
-    function resetWatchdog(controller) {
-        if (watchdogTimer)
-            clearTimeout(watchdogTimer);
-        watchdogTimer = setTimeout(() => {
-            aborted = true;
-            logWarn("Stream inactivity timeout — no data received", {
-                timeoutMs: inactivityTimeoutMs,
-            });
-            controller.error(new Error(`Stream inactivity timeout after ${inactivityTimeoutMs}ms`));
-            reader.cancel().catch(() => { });
-            originalCleanup?.();
-        }, inactivityTimeoutMs);
-    }
-    function clearWatchdog() {
-        if (watchdogTimer) {
-            clearTimeout(watchdogTimer);
-            watchdogTimer = null;
-        }
-        originalCleanup?.();
-    }
-    const watchedStream = new ReadableStream({
-        start(controller) {
-            resetWatchdog(controller);
-        },
-        async pull(controller) {
-            try {
-                const { done, value } = await reader.read();
-                if (done) {
-                    clearWatchdog();
-                    controller.close();
-                    return;
-                }
-                // Data received — reset the inactivity timer
-                resetWatchdog(controller);
-                controller.enqueue(value);
-            }
-            catch (error) {
-                clearWatchdog();
-                if (!aborted) {
-                    controller.error(error);
-                }
-            }
-        },
-        cancel() {
-            clearWatchdog();
-            reader.cancel().catch(() => { });
-        },
-    });
-    // Create a new Response with the watched stream, preserving headers/status
-    const watchedResponse = new Response(watchedStream, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: response.headers,
-    });
-    return watchedResponse;
 }
 /**
  * Injects required DashScope OAuth headers into fetch request
@@ -1236,8 +1145,37 @@ async function failFastFetch(input, init, initialAccountId) {
                     attempt: retryAttempt + 1,
                 });
             }
-            const RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504];
+            const RETRYABLE_STATUS_CODES = [401, 429, 500, 502, 503, 504];
             if (RETRYABLE_STATUS_CODES.includes(response.status)) {
+                // Handle 401 — token expired between turns (SDK caches provider, doesn't re-call loader)
+                if (response.status === 401) {
+                    logWarn("Got 401 — attempting token refresh", {
+                        request_id: context.requestId,
+                        attempt: retryAttempt + 1,
+                    });
+                    // Consume body to avoid leak
+                    await response.text().catch(() => "");
+                    try {
+                        // Try to get a fresh token via multi-account flow
+                        const freshAccount = await getActiveOAuthAccount({ allowExhausted: false });
+                        if (freshAccount?.accessToken) {
+                            applyAuthorizationHeader(requestInit, freshAccount.accessToken);
+                            requestInput = rewriteRequestBaseUrl(requestInput, freshAccount.resourceUrl ?? "");
+                            context.accountID = freshAccount.accountId;
+                            logInfo("Token refreshed after 401, retrying", {
+                                request_id: context.requestId,
+                                accountID: context.accountID,
+                            });
+                            response = await sendWithTimeout(requestInput, requestInit);
+                            continue;
+                        }
+                    }
+                    catch (refreshError) {
+                        logWarn("Token refresh failed after 401", refreshError);
+                    }
+                    // Refresh failed — return 401 to SDK so OpenCode can re-auth
+                    return makeFailFastErrorResponse(401, "authentication_expired", "OAuth token expired and refresh failed. Please re-authenticate.");
+                }
                 if (response.status === 429) {
                     const firstBody = await response.text().catch(() => "");
                     if (payload && isInsufficientQuota(firstBody)) {
@@ -1358,9 +1296,9 @@ async function failFastFetch(input, init, initialAccountId) {
                     continue;
                 }
             }
-            return wrapResponseWithStreamWatchdog(response);
+            return response;
         }
-        return wrapResponseWithStreamWatchdog(response);
+        return response;
     }
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
