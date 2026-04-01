@@ -11,16 +11,17 @@
  *
  * @license MIT with Usage Disclaimer (see LICENSE file)
  * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
- * @version 2.4.2
+ * @version 2.5.0
  */
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createPKCE, requestDeviceCode, pollForToken, getApiBaseUrl, saveToken, refreshAccessToken, loadStoredToken, getValidToken, upsertOAuthAccount, getActiveOAuthAccount, markOAuthAccountQuotaExhausted, switchToNextHealthyOAuthAccount, } from "./lib/auth/auth.js";
-import { PROVIDER_ID, AUTH_LABELS, DEVICE_FLOW, PORTAL_HEADERS, TOKEN_REFRESH_BUFFER_MS } from "./lib/constants.js";
+import { openBrowserUrl } from "./lib/auth/browser.js";
+import { PROVIDER_ID, AUTH_LABELS, DEVICE_FLOW, PORTAL_HEADERS, TOKEN_REFRESH_BUFFER_MS, } from "./lib/constants.js";
 import { logError, logInfo, logWarn, LOGGING_ENABLED } from "./lib/logger.js";
-/** Request timeout — matches CLI's DEFAULT_TIMEOUT (120 seconds) */
-const CHAT_REQUEST_TIMEOUT_MS = 120000;
+/** Default quiet period without upstream activity before aborting a request */
+const DEFAULT_CHAT_REQUEST_IDLE_TIMEOUT_MS = 120000;
 /** Maximum number of retry attempts for failed requests */
 const CHAT_MAX_RETRIES = 3;
 /** Output token cap for coder-model (64K tokens) */
@@ -116,7 +117,9 @@ let timingChain = Promise.resolve();
 async function applyRequestTiming() {
     const prev = timingChain;
     let resolveMine;
-    timingChain = new Promise((r) => { resolveMine = r; });
+    timingChain = new Promise((r) => {
+        resolveMine = r;
+    });
     try {
         await prev; // wait for previous timing slot
         const now = Date.now();
@@ -172,7 +175,8 @@ function capPayloadMaxTokens(payload) {
         next.max_tokens = limit;
         changed = true;
     }
-    if (typeof next.max_completion_tokens === "number" && next.max_completion_tokens > limit) {
+    if (typeof next.max_completion_tokens === "number" &&
+        next.max_completion_tokens > limit) {
         next.max_completion_tokens = limit;
         changed = true;
     }
@@ -188,7 +192,8 @@ function capPayloadMaxTokens(payload) {
             options.max_tokens = limit;
             optionsChanged = true;
         }
-        if (typeof options.max_completion_tokens === "number" && options.max_completion_tokens > limit) {
+        if (typeof options.max_completion_tokens === "number" &&
+            options.max_completion_tokens > limit) {
             options.max_completion_tokens = limit;
             optionsChanged = true;
         }
@@ -263,6 +268,163 @@ function appendLimitedText(current, chunk) {
     }
     return next.slice(next.length - CLI_FALLBACK_MAX_BUFFER_CHARS);
 }
+function normalizeAbortReason(reason, fallbackMessage) {
+    if (reason instanceof Error) {
+        return reason;
+    }
+    if (typeof reason === "string" && reason.trim().length > 0) {
+        return new Error(reason);
+    }
+    return new Error(fallbackMessage);
+}
+function getRequestIdleTimeoutMs() {
+    const raw = process.env.OPENCODE_QWEN_REQUEST_IDLE_TIMEOUT_MS;
+    if (typeof raw !== "string" || raw.trim().length === 0) {
+        return DEFAULT_CHAT_REQUEST_IDLE_TIMEOUT_MS;
+    }
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed < 10) {
+        return DEFAULT_CHAT_REQUEST_IDLE_TIMEOUT_MS;
+    }
+    return Math.floor(parsed);
+}
+function isAbortError(error) {
+    return (typeof error === "object" &&
+        error !== null &&
+        "name" in error &&
+        error.name === "AbortError");
+}
+function createRequestActivityGuard(sourceSignal, timeoutMs) {
+    const controller = new AbortController();
+    let timeoutId;
+    const abortWith = (reason, fallbackMessage) => {
+        if (!controller.signal.aborted) {
+            controller.abort(normalizeAbortReason(reason, fallbackMessage));
+        }
+    };
+    const reset = () => {
+        if (controller.signal.aborted) {
+            return;
+        }
+        if (timeoutId) {
+            clearTimeout(timeoutId);
+        }
+        timeoutId = setTimeout(() => {
+            abortWith("request_idle_timeout", "request_idle_timeout");
+        }, timeoutMs);
+    };
+    const onSourceAbort = () => {
+        abortWith(sourceSignal?.reason, "request_aborted");
+    };
+    if (sourceSignal) {
+        if (sourceSignal.aborted) {
+            onSourceAbort();
+        }
+        else {
+            sourceSignal.addEventListener("abort", onSourceAbort, { once: true });
+        }
+    }
+    if (!controller.signal.aborted) {
+        reset();
+    }
+    return {
+        signal: controller.signal,
+        reset,
+        cleanup() {
+            if (timeoutId) {
+                clearTimeout(timeoutId);
+                timeoutId = undefined;
+            }
+            if (sourceSignal) {
+                sourceSignal.removeEventListener("abort", onSourceAbort);
+            }
+        },
+        abortedReason() {
+            if (!controller.signal.aborted) {
+                return null;
+            }
+            return normalizeAbortReason(controller.signal.reason, "request_aborted");
+        },
+    };
+}
+function cloneResponseWithBody(response, body) {
+    return new Response(body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: new Headers(response.headers),
+    });
+}
+function wrapStreamingResponseWithActivityTimeout(response, guard) {
+    if (!response.body) {
+        guard.cleanup();
+        return response;
+    }
+    const sourceBody = response.body;
+    let reader = null;
+    const stream = new ReadableStream({
+        start(controller) {
+            reader = sourceBody.getReader();
+            let settled = false;
+            const onAbort = () => {
+                const reason = guard.abortedReason() ?? new Error("request_aborted");
+                void reader?.cancel(reason).catch(() => undefined);
+                finish("error", reason);
+            };
+            const finish = (action, value) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                guard.cleanup();
+                guard.signal.removeEventListener("abort", onAbort);
+                if (action === "close") {
+                    controller.close();
+                    return;
+                }
+                controller.error(value);
+            };
+            if (guard.signal.aborted) {
+                onAbort();
+                return;
+            }
+            guard.signal.addEventListener("abort", onAbort, { once: true });
+            const pump = async () => {
+                try {
+                    while (true) {
+                        guard.reset();
+                        const chunk = await reader.read();
+                        if (chunk.done) {
+                            finish("close");
+                            return;
+                        }
+                        guard.reset();
+                        controller.enqueue(chunk.value);
+                    }
+                }
+                catch (error) {
+                    finish("error", guard.abortedReason() ?? error);
+                }
+                finally {
+                    try {
+                        reader?.releaseLock();
+                    }
+                    catch (_error) {
+                        // ignore
+                    }
+                }
+            };
+            void pump();
+        },
+        async cancel(reason) {
+            guard.cleanup();
+            if (!reader) {
+                return;
+            }
+            await reader.cancel(reason).catch(() => undefined);
+        },
+    });
+    return cloneResponseWithBody(response, stream);
+}
 /**
  * Checks if value is a Request instance
  * @param {*} value - Value to check
@@ -279,7 +441,9 @@ function isRequestInstance(value) {
  */
 async function normalizeFetchInvocation(input, init) {
     const requestInit = init ? { ...init } : {};
-    let requestInput = isRequestInstance(input) ? input.url : input;
+    let requestInput = isRequestInstance(input)
+        ? input.url
+        : input;
     if (!isRequestInstance(input)) {
         return { requestInput, requestInit };
     }
@@ -315,7 +479,7 @@ function getHeaderValue(headers, headerName) {
     }
     const normalizedHeader = headerName.toLowerCase();
     if (headers instanceof Headers) {
-        return headers.get(headerName) ?? headers.get(normalizedHeader) ?? undefined;
+        return (headers.get(headerName) ?? headers.get(normalizedHeader) ?? undefined);
     }
     if (Array.isArray(headers)) {
         const pair = headers.find(([name]) => String(name).toLowerCase() === normalizedHeader);
@@ -364,7 +528,9 @@ function applyAuthorizationHeader(requestInit, accessToken) {
     requestInit.headers["authorization"] = bearer;
 }
 function rewriteRequestBaseUrl(requestInput, resourceUrl) {
-    if (typeof requestInput !== "string" || typeof resourceUrl !== "string" || resourceUrl.length === 0) {
+    if (typeof requestInput !== "string" ||
+        typeof resourceUrl !== "string" ||
+        resourceUrl.length === 0) {
         return requestInput;
     }
     try {
@@ -419,7 +585,8 @@ function applyJsonRequestBody(requestInit, payload) {
         }
     }
     if (!hasContentType) {
-        requestInit.headers["content-type"] = "application/json";
+        requestInit.headers["content-type"] =
+            "application/json";
     }
 }
 /**
@@ -467,11 +634,13 @@ function sanitizeOutgoingPayload(payload) {
         changed = true;
     }
     // Cap max_tokens fields
-    if (typeof sanitized.max_tokens === "number" && sanitized.max_tokens > CHAT_MAX_TOKENS_CAP) {
+    if (typeof sanitized.max_tokens === "number" &&
+        sanitized.max_tokens > CHAT_MAX_TOKENS_CAP) {
         sanitized.max_tokens = CHAT_MAX_TOKENS_CAP;
         changed = true;
     }
-    if (typeof sanitized.max_completion_tokens === "number" && sanitized.max_completion_tokens > CHAT_MAX_TOKENS_CAP) {
+    if (typeof sanitized.max_completion_tokens === "number" &&
+        sanitized.max_completion_tokens > CHAT_MAX_TOKENS_CAP) {
         sanitized.max_completion_tokens = CHAT_MAX_TOKENS_CAP;
         changed = true;
     }
@@ -483,7 +652,8 @@ function sanitizeOutgoingPayload(payload) {
         };
         changed = true;
     }
-    else if (typeof sanitized.metadata === "object" && sanitized.metadata !== null) {
+    else if (typeof sanitized.metadata === "object" &&
+        sanitized.metadata !== null) {
         // Deep-copy metadata to avoid mutating the caller's object under concurrency
         const meta = { ...sanitized.metadata };
         sanitized.metadata = meta;
@@ -530,11 +700,13 @@ function createQuotaDegradedPayload(payload) {
         changed = true;
     }
     // Reduce max_tokens
-    if (typeof degraded.max_tokens !== "number" || degraded.max_tokens > QUOTA_DEGRADE_MAX_TOKENS) {
+    if (typeof degraded.max_tokens !== "number" ||
+        degraded.max_tokens > QUOTA_DEGRADE_MAX_TOKENS) {
         degraded.max_tokens = QUOTA_DEGRADE_MAX_TOKENS;
         changed = true;
     }
-    if (typeof degraded.max_completion_tokens === "number" && degraded.max_completion_tokens > QUOTA_DEGRADE_MAX_TOKENS) {
+    if (typeof degraded.max_completion_tokens === "number" &&
+        degraded.max_completion_tokens > QUOTA_DEGRADE_MAX_TOKENS) {
         degraded.max_completion_tokens = QUOTA_DEGRADE_MAX_TOKENS;
         changed = true;
     }
@@ -552,7 +724,8 @@ function isInsufficientQuota(text) {
     try {
         const parsed = JSON.parse(text);
         const errorCode = parsed?.error?.code;
-        return typeof errorCode === "string" && errorCode.toLowerCase() === "insufficient_quota";
+        return (typeof errorCode === "string" &&
+            errorCode.toLowerCase() === "insufficient_quota");
     }
     catch (_error) {
         return text.toLowerCase().includes("insufficient_quota");
@@ -570,15 +743,21 @@ function extractMessageText(content) {
     if (!Array.isArray(content)) {
         return "";
     }
-    return content.map((part) => {
+    return content
+        .map((part) => {
         if (typeof part === "string") {
             return part;
         }
-        if (part && typeof part === "object" && typeof part.text === "string") {
+        if (part &&
+            typeof part === "object" &&
+            typeof part.text === "string") {
             return part.text;
         }
         return "";
-    }).filter(Boolean).join("\n").trim();
+    })
+        .filter(Boolean)
+        .join("\n")
+        .trim();
 }
 /**
  * Checks whether content contains non-text parts
@@ -644,7 +823,9 @@ function buildQwenCliPrompt(payload) {
             return text;
         }
     }
-    const merged = messages.slice(-6).map((message) => {
+    const merged = messages
+        .slice(-6)
+        .map((message) => {
         const msg = message;
         const text = extractMessageText(msg?.content);
         if (!text) {
@@ -652,7 +833,9 @@ function buildQwenCliPrompt(payload) {
         }
         const role = typeof msg?.role === "string" ? msg.role.toUpperCase() : "UNKNOWN";
         return `${role}: ${text}`;
-    }).filter(Boolean).join("\n\n");
+    })
+        .filter(Boolean)
+        .join("\n\n");
     return merged || "Please respond to the latest user request.";
 }
 /**
@@ -692,7 +875,9 @@ function parseQwenCliEvents(rawOutput) {
 function extractQwenCliText(events) {
     for (let index = events.length - 1; index >= 0; index -= 1) {
         const event = events[index];
-        if (event?.type === "result" && typeof event.result === "string" && event.result.trim()) {
+        if (event?.type === "result" &&
+            typeof event.result === "string" &&
+            event.result.trim()) {
             return event.result.trim();
         }
     }
@@ -702,12 +887,18 @@ function extractQwenCliText(events) {
         if (!Array.isArray(content)) {
             continue;
         }
-        const text = content.map((part) => {
-            if (part && typeof part === "object" && typeof part.text === "string") {
+        const text = content
+            .map((part) => {
+            if (part &&
+                typeof part === "object" &&
+                typeof part.text === "string") {
                 return part.text;
             }
             return "";
-        }).filter(Boolean).join("\n").trim();
+        })
+            .filter(Boolean)
+            .join("\n")
+            .trim();
         if (text) {
             return text;
         }
@@ -825,7 +1016,9 @@ function makeQwenCliCompletionResponse(model, content, context, streamMode) {
  * @returns {Promise<{ ok: boolean, response?: Response, reason?: string, stdout?: string, stderr?: string }>} Fallback execution result
  */
 async function runQwenCliFallback(payload, context, abortSignal) {
-    const model = typeof payload?.model === "string" && payload.model.length > 0 ? payload.model : "coder-model";
+    const model = typeof payload?.model === "string" && payload.model.length > 0
+        ? payload.model
+        : "coder-model";
     const streamMode = payload?.stream === true;
     if (payloadContainsNonTextMessages(payload)) {
         if (LOGGING_ENABLED) {
@@ -842,7 +1035,15 @@ async function runQwenCliFallback(payload, context, abortSignal) {
         };
     }
     const prompt = buildQwenCliPrompt(payload);
-    const args = [prompt, "-o", "json", "--max-session-turns", "1", "--model", model];
+    const args = [
+        prompt,
+        "-o",
+        "json",
+        "--max-session-turns",
+        "1",
+        "--model",
+        model,
+    ];
     if (LOGGING_ENABLED) {
         logWarn("Attempting qwen CLI fallback after quota error", {
             request_id: context.requestId,
@@ -966,14 +1167,15 @@ async function runQwenCliFallback(payload, context, abortSignal) {
 function makeQuotaFailFastResponse(text, sourceHeaders, context) {
     const headers = new Headers(sourceHeaders);
     headers.set("content-type", "application/json");
-    const body = text || JSON.stringify({
-        error: {
-            message: "Qwen quota/rate limit reached",
-            type: "invalid_request_error",
-            param: null,
-            code: "insufficient_quota",
-        },
-    });
+    const body = text ||
+        JSON.stringify({
+            error: {
+                message: "Qwen quota/rate limit reached",
+                type: "invalid_request_error",
+                param: null,
+                code: "insufficient_quota",
+            },
+        });
     if (LOGGING_ENABLED) {
         logWarn("Qwen request failed with 429", {
             request_id: context.requestId,
@@ -989,48 +1191,30 @@ function makeQuotaFailFastResponse(text, sourceHeaders, context) {
     });
 }
 /**
- * Performs fetch request with timeout protection
- * @param {Request|string} input - Fetch input
- * @param {RequestInit} requestInit - Fetch options
- * @returns {Promise<Response>} Fetch response
+ * Performs fetch request with activity-based timeout protection.
+ * Unlike a total timeout, this only aborts when the upstream goes quiet
+ * for too long, which prevents long streaming responses from being cut off.
  */
-async function sendWithTimeout(input, requestInit) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(new Error("request_timeout")), CHAT_REQUEST_TIMEOUT_MS);
-    const sourceSignal = requestInit.signal;
-    const onSourceAbort = () => controller.abort(sourceSignal?.reason);
-    if (sourceSignal) {
-        if (sourceSignal.aborted) {
-            controller.abort(sourceSignal.reason);
-        }
-        else {
-            sourceSignal.addEventListener("abort", onSourceAbort, { once: true });
-        }
-    }
+async function sendWithActivityTimeout(input, requestInit, expectStreaming) {
+    const guard = createRequestActivityGuard(requestInit.signal, getRequestIdleTimeoutMs());
     try {
         const response = await fetch(input, {
             ...requestInit,
-            signal: controller.signal,
+            signal: guard.signal,
         });
-        // IMPORTANT: Do NOT clearTimeout here for streaming 200 responses.
-        // The timeout keeps running, guarding the full stream body consumption.
-        // For non-2xx or bodyless responses, clear immediately.
-        if (!response.ok || !response.body) {
-            clearTimeout(timeoutId);
-            if (sourceSignal)
-                sourceSignal.removeEventListener("abort", onSourceAbort);
+        const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+        const shouldWrapStreamingBody = response.ok &&
+            !!response.body &&
+            (expectStreaming || contentType.includes("text/event-stream"));
+        if (!shouldWrapStreamingBody) {
+            guard.cleanup();
+            return response;
         }
-        // Note: For streaming 200 responses, the timeout remains active.
-        // When the SDK finishes reading the stream (or the timeout fires),
-        // the AbortSignal will abort the underlying connection.
-        // The timeout is our safety net against stalled streams.
-        return response;
+        return wrapStreamingResponseWithActivityTimeout(response, guard);
     }
     catch (error) {
-        clearTimeout(timeoutId);
-        if (sourceSignal)
-            sourceSignal.removeEventListener("abort", onSourceAbort);
-        throw error;
+        guard.cleanup();
+        throw guard.abortedReason() ?? error;
     }
 }
 /**
@@ -1094,7 +1278,9 @@ async function failFastFetch(input, init, initialAccountId) {
     applyDashScopeHeaders(requestInit);
     const sourceSignal = requestInit.signal;
     const rawPayload = parseJsonRequestBody(requestInit);
-    const sessionID = typeof rawPayload?.sessionID === "string" ? rawPayload.sessionID : undefined;
+    const sessionID = typeof rawPayload?.sessionID === "string"
+        ? rawPayload.sessionID
+        : undefined;
     let payload = rawPayload;
     if (payload) {
         // Ensure we never exceed DashScope model output limits.
@@ -1121,9 +1307,15 @@ async function failFastFetch(input, init, initialAccountId) {
             sessionID: context.sessionID,
             modelID: context.modelID,
             accountID: context.accountID,
-            max_tokens: typeof payload?.max_tokens === "number" ? payload.max_tokens : undefined,
-            max_completion_tokens: typeof payload?.max_completion_tokens === "number" ? payload.max_completion_tokens : undefined,
-            message_count: Array.isArray(payload?.messages) ? payload.messages.length : undefined,
+            max_tokens: typeof payload?.max_tokens === "number"
+                ? payload.max_tokens
+                : undefined,
+            max_completion_tokens: typeof payload?.max_completion_tokens === "number"
+                ? payload.max_completion_tokens
+                : undefined,
+            message_count: Array.isArray(payload?.messages)
+                ? payload.messages.length
+                : undefined,
             stream: payload?.stream === true,
         });
     }
@@ -1132,7 +1324,7 @@ async function failFastFetch(input, init, initialAccountId) {
         await requestSemaphore.acquire();
         // Apply request timing to prevent burst detection
         await applyRequestTiming();
-        let response = await sendWithTimeout(requestInput, requestInit);
+        let response = await sendWithActivityTimeout(requestInput, requestInit, payload?.stream === true);
         const MAX_REQUEST_RETRIES = CHAT_MAX_RETRIES;
         for (let retryAttempt = 0; retryAttempt < MAX_REQUEST_RETRIES; retryAttempt++) {
             if (LOGGING_ENABLED) {
@@ -1157,7 +1349,9 @@ async function failFastFetch(input, init, initialAccountId) {
                     await response.text().catch(() => "");
                     try {
                         // Try to get a fresh token via multi-account flow
-                        const freshAccount = await getActiveOAuthAccount({ allowExhausted: false });
+                        const freshAccount = await getActiveOAuthAccount({
+                            allowExhausted: false,
+                        });
                         if (freshAccount?.accessToken) {
                             applyAuthorizationHeader(requestInit, freshAccount.accessToken);
                             requestInput = rewriteRequestBaseUrl(requestInput, freshAccount.resourceUrl ?? "");
@@ -1166,7 +1360,7 @@ async function failFastFetch(input, init, initialAccountId) {
                                 request_id: context.requestId,
                                 accountID: context.accountID,
                             });
-                            response = await sendWithTimeout(requestInput, requestInit);
+                            response = await sendWithActivityTimeout(requestInput, requestInit, payload?.stream === true);
                             continue;
                         }
                     }
@@ -1182,7 +1376,9 @@ async function failFastFetch(input, init, initialAccountId) {
                         if (context.accountID) {
                             try {
                                 await markOAuthAccountQuotaExhausted(context.accountID, "insufficient_quota");
-                                const switched = await switchToNextHealthyOAuthAccount([context.accountID]);
+                                const switched = await switchToNextHealthyOAuthAccount([
+                                    context.accountID,
+                                ]);
                                 if (switched?.accessToken) {
                                     const rotatedInit = { ...requestInit };
                                     requestInput = rewriteRequestBaseUrl(requestInput, switched.resourceUrl ?? "");
@@ -1199,7 +1395,7 @@ async function failFastFetch(input, init, initialAccountId) {
                                             totalAccounts: switched.totalAccountCount,
                                         });
                                     }
-                                    response = await sendWithTimeout(requestInput, rotatedInit);
+                                    response = await sendWithActivityTimeout(requestInput, rotatedInit, payload?.stream === true);
                                     if (retryAttempt < MAX_REQUEST_RETRIES) {
                                         continue;
                                     }
@@ -1220,7 +1416,7 @@ async function failFastFetch(input, init, initialAccountId) {
                                     modelID: context.modelID,
                                 });
                             }
-                            response = await sendWithTimeout(requestInput, fallbackInit);
+                            response = await sendWithActivityTimeout(requestInput, fallbackInit, degradedPayload.stream === true);
                             if (retryAttempt < MAX_REQUEST_RETRIES) {
                                 continue;
                             }
@@ -1279,6 +1475,8 @@ async function failFastFetch(input, init, initialAccountId) {
                     return makeQuotaFailFastResponse(firstBody, response.headers, context);
                 }
                 if (retryAttempt < MAX_REQUEST_RETRIES) {
+                    // Consume body to release connection before retrying
+                    await response.text().catch(() => "");
                     if (LOGGING_ENABLED) {
                         logWarn(`Retrying after ${response.status}, attempt ${retryAttempt + 2}/${MAX_REQUEST_RETRIES + 1}`, {
                             request_id: context.requestId,
@@ -1292,7 +1490,7 @@ async function failFastFetch(input, init, initialAccountId) {
                     // NOTE: 5xx retry uses original requestInit, not degraded payload.
                     // This is acceptable because 5xx errors are typically server-side transient failures,
                     // and the full payload is more likely to succeed than the degraded one.
-                    response = await sendWithTimeout(requestInput, requestInit);
+                    response = await sendWithActivityTimeout(requestInput, requestInit, payload?.stream === true);
                     continue;
                 }
             }
@@ -1303,9 +1501,18 @@ async function failFastFetch(input, init, initialAccountId) {
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const lowered = message.toLowerCase();
-        if (lowered.includes("aborted") || lowered.includes("timeout")) {
-            logWarn("Qwen request timeout (fail-fast)", { timeoutMs: CHAT_REQUEST_TIMEOUT_MS, message });
-            return makeFailFastErrorResponse(400, "request_timeout", `Qwen request timed out after ${CHAT_REQUEST_TIMEOUT_MS}ms`);
+        if (sourceSignal?.aborted) {
+            return makeFailFastErrorResponse(400, "request_aborted", "Qwen request was aborted");
+        }
+        if (isAbortError(error) ||
+            lowered.includes("timeout") ||
+            lowered.includes("request_idle_timeout")) {
+            const idleTimeoutMs = getRequestIdleTimeoutMs();
+            logWarn("Qwen request timeout (fail-fast)", {
+                timeoutMs: idleTimeoutMs,
+                message,
+            });
+            return makeFailFastErrorResponse(400, "request_timeout", `Qwen request stalled for more than ${idleTimeoutMs}ms`);
         }
         logError("Qwen upstream fetch failed", { message });
         return makeFailFastErrorResponse(400, "upstream_unavailable", "Qwen upstream request failed");
@@ -1322,7 +1529,9 @@ async function failFastFetch(input, init, initialAccountId) {
  * @returns {Promise<{ accessToken: string, resourceUrl?: string, accountId?: string }|null>} Access token state or null
  */
 async function getValidAccessToken(getAuth) {
-    const activeOAuthAccount = await getActiveOAuthAccount({ allowExhausted: false });
+    const activeOAuthAccount = await getActiveOAuthAccount({
+        allowExhausted: false,
+    });
     if (activeOAuthAccount?.accessToken) {
         return {
             accessToken: activeOAuthAccount.accessToken,
@@ -1344,7 +1553,10 @@ async function getValidAccessToken(getAuth) {
     let accessToken = auth.access;
     let resourceUrl = undefined;
     // Refresh if expired (using same buffer as auth.ts TOKEN_REFRESH_BUFFER_MS)
-    if (accessToken && auth.expires && Date.now() > auth.expires - TOKEN_REFRESH_BUFFER_MS && auth.refresh) {
+    if (accessToken &&
+        auth.expires &&
+        Date.now() > auth.expires - TOKEN_REFRESH_BUFFER_MS &&
+        auth.refresh) {
         try {
             const refreshResult = await refreshAccessToken(auth.refresh);
             if (refreshResult.type === "success") {
@@ -1376,7 +1588,9 @@ async function getValidAccessToken(getAuth) {
                 type: "success",
                 access: accessToken || auth.access,
                 refresh: auth.refresh,
-                expires: typeof auth.expires === "number" ? auth.expires : Date.now() + 3600 * 1000,
+                expires: typeof auth.expires === "number"
+                    ? auth.expires
+                    : Date.now() + 3600 * 1000,
                 resourceUrl,
             };
             saveToken(sdkToken);
@@ -1445,7 +1659,10 @@ export const QwenAuthPlugin = async (_input) => {
                 if (provider?.models) {
                     for (const model of Object.values(provider.models)) {
                         if (model)
-                            model.cost = { input: 0, output: 0 };
+                            model.cost = {
+                                input: 0,
+                                output: 0,
+                            };
                     }
                 }
                 const tokenState = await getValidAccessToken(getAuth);
@@ -1459,7 +1676,7 @@ export const QwenAuthPlugin = async (_input) => {
                 return {
                     apiKey: tokenState.accessToken,
                     baseURL,
-                    timeout: CHAT_REQUEST_TIMEOUT_MS,
+                    timeout: false,
                     maxRetries: CHAT_MAX_RETRIES,
                     fetch: (input, init) => failFastFetch(input, init, currentAccountId),
                 };
@@ -1482,8 +1699,10 @@ export const QwenAuthPlugin = async (_input) => {
                         // Display user code
                         console.log(`\nPlease visit: ${deviceAuth.verification_uri}`);
                         console.log(`And enter code: ${deviceAuth.user_code}\n`);
-                        // Verification URL - SDK will open browser automatically when method=auto
-                        const verificationUrl = deviceAuth.verification_uri_complete || deviceAuth.verification_uri;
+                        const verificationUrl = deviceAuth.verification_uri_complete ||
+                            deviceAuth.verification_uri;
+                        // Open browser proactively — OpenCode only prints the URL but does not open it
+                        openBrowserUrl(verificationUrl);
                         return {
                             url: verificationUrl,
                             method: "auto",
@@ -1568,7 +1787,9 @@ export const QwenAuthPlugin = async (_input) => {
                         }
                         console.log(`\n[Add Account] Please visit: ${deviceAuth.verification_uri}`);
                         console.log(`[Add Account] Enter code: ${deviceAuth.user_code}\n`);
-                        const verificationUrl = deviceAuth.verification_uri_complete || deviceAuth.verification_uri;
+                        const verificationUrl = deviceAuth.verification_uri_complete ||
+                            deviceAuth.verification_uri;
+                        openBrowserUrl(verificationUrl);
                         return {
                             url: verificationUrl,
                             method: "auto",
@@ -1664,13 +1885,14 @@ export const QwenAuthPlugin = async (_input) => {
          * coder-model and vision-model (according to QWEN_OAUTH_ALLOWED_MODELS from original CLI)
          */
         config: async (config) => {
-            const providers = config.provider || {};
+            const providers = config
+                .provider || {};
             providers[PROVIDER_ID] = {
                 npm: "@ai-sdk/openai-compatible",
                 name: "Qwen Code",
                 options: {
                     baseURL: getBaseUrl(),
-                    timeout: CHAT_REQUEST_TIMEOUT_MS,
+                    timeout: false,
                     maxRetries: CHAT_MAX_RETRIES,
                 },
                 models: {
@@ -1693,17 +1915,21 @@ export const QwenAuthPlugin = async (_input) => {
                         name: "Qwen Vision",
                         attachment: true,
                         reasoning: false,
-                        limit: { context: 131072, output: DASH_SCOPE_OUTPUT_LIMITS["vision-model"] },
+                        limit: {
+                            context: 131072,
+                            output: DASH_SCOPE_OUTPUT_LIMITS["vision-model"],
+                        },
                         cost: { input: 0, output: 0 },
                         modalities: { input: ["text", "image"], output: ["text"] },
                     },
                 },
             };
-            config.provider = providers;
+            config.provider =
+                providers;
         },
         /**
          * Apply dynamic chat parameters before sending request
-         * Ensures tokens and timeouts don't exceed plugin limits
+         * Ensures token-related params stay within plugin limits
          *
          * @param {*} input - Original chat request parameters
          * @param {*} output - Final payload to be sent
@@ -1713,16 +1939,16 @@ export const QwenAuthPlugin = async (_input) => {
                 const out = output;
                 out.options = out.options || {};
                 out.options.maxRetries = CHAT_MAX_RETRIES;
-                if (typeof out.options.timeout !== "number" || out.options.timeout > CHAT_REQUEST_TIMEOUT_MS) {
-                    out.options.timeout = CHAT_REQUEST_TIMEOUT_MS;
-                }
-                if (typeof out.max_tokens === "number" && out.max_tokens > CHAT_MAX_TOKENS_CAP) {
+                if (typeof out.max_tokens === "number" &&
+                    out.max_tokens > CHAT_MAX_TOKENS_CAP) {
                     out.max_tokens = CHAT_MAX_TOKENS_CAP;
                 }
-                if (typeof out.max_completion_tokens === "number" && out.max_completion_tokens > CHAT_MAX_TOKENS_CAP) {
+                if (typeof out.max_completion_tokens === "number" &&
+                    out.max_completion_tokens > CHAT_MAX_TOKENS_CAP) {
                     out.max_completion_tokens = CHAT_MAX_TOKENS_CAP;
                 }
-                if (typeof out.maxTokens === "number" && out.maxTokens > CHAT_MAX_TOKENS_CAP) {
+                if (typeof out.maxTokens === "number" &&
+                    out.maxTokens > CHAT_MAX_TOKENS_CAP) {
                     out.maxTokens = CHAT_MAX_TOKENS_CAP;
                 }
                 if (typeof out.options.max_tokens === "number" &&

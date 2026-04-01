@@ -11,7 +11,7 @@
  *
  * @license MIT with Usage Disclaimer (see LICENSE file)
  * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
- * @version 2.4.2
+ * @version 2.5.0
  */
 import type { Plugin } from "@opencode-ai/plugin";
 /**
