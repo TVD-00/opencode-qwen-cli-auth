@@ -1,34 +1,14 @@
 /**
- * @fileoverview Alibaba Qwen OAuth Authentication Plugin for opencode
- * Main plugin entry point implementing OAuth 2.0 Device Authorization Grant
- * Handles authentication, request transformation, and error recovery
+ * Qwen OAuth authentication plugin for OpenCode
  *
- * Architecture:
- * - OAuth flow: PKCE + Device Code Grant (RFC 8628)
- * - Token management: Automatic refresh with file-based storage
- * - Request handling: Custom fetch wrapper with retry logic
- * - Error recovery: Quota degradation and CLI fallback
+ * Architecture follows OpenCode's Copilot/Codex plugin pattern:
+ * - auth.loader returns { fetch, apiKey, baseURL, timeout }
+ * - Custom fetch handles DashScope headers and token refresh
+ * - OpenCode handles timeout, retries, and streaming natively
  *
- * @license MIT with Usage Disclaimer (see LICENSE file)
- * @repository https://github.com/TVD-00/opencode-qwen-cli-auth
- * @version 2.5.0
+ * @version 3.0.0
  */
 import type { Plugin } from "@opencode-ai/plugin";
-/**
- * Alibaba Qwen OAuth authentication plugin for opencode
- * Integrates Qwen OAuth device flow and API handling into opencode SDK
- *
- * @param {*} _input - Plugin initialization input
- * @returns {Promise<Object>} Plugin configuration and hooks
- *
- * @example
- * ```json
- * {
- *   "plugin": ["opencode-alibaba-qwen-cli-auth"],
- *   "model": "qwen-code/coder-model"
- * }
- * ```
- */
 export declare const QwenAuthPlugin: Plugin;
 export default QwenAuthPlugin;
 //# sourceMappingURL=index.d.ts.map
