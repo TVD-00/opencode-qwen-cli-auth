@@ -134,22 +134,22 @@ describe("isTokenExpired", () => {
     expect(isTokenExpired(expiresAt)).toBe(false);
   });
 
-  it("returns true when token expires within 5-minute buffer (4 minutes)", () => {
-    // TOKEN_REFRESH_BUFFER_MS = 30 000 ms; 4 min = 240 000 ms < buffer → expired
-    // Wait — buffer is 30 seconds per constants.ts, not 5 minutes.
-    // expires in 20 seconds → within 30 s buffer → true
-    const expiresAt = Date.now() + 20 * 1000;
+  it("returns true when token expires within buffer (20 minutes from now < 30-min buffer)", () => {
+    // TOKEN_REFRESH_BUFFER_MS = 30 * 60 * 1000 (30 minutes)
+    // 20 minutes from now is within the 30-min buffer → expired
+    const expiresAt = Date.now() + 20 * 60 * 1000;
     expect(isTokenExpired(expiresAt)).toBe(true);
   });
 
-  it("returns false when token expires 6 minutes from now (outside 30-second buffer)", () => {
-    const expiresAt = Date.now() + 6 * 60 * 1000;
+  it("returns false when token expires 31 minutes from now (outside 30-min buffer)", () => {
+    const expiresAt = Date.now() + 31 * 60 * 1000;
     expect(isTokenExpired(expiresAt)).toBe(false);
   });
 
-  it("returns true when token expires exactly at buffer boundary", () => {
-    // TOKEN_REFRESH_BUFFER_MS = 30_000; expires in exactly 30 s → Date.now() >= expiresAt - 30_000 → true
-    const expiresAt = Date.now() + 30_000;
+  it("returns true when token expires exactly at buffer boundary (30 min)", () => {
+    // TOKEN_REFRESH_BUFFER_MS = 30 * 60 * 1000; expires in exactly 30 min
+    // Date.now() >= expiresAt - 30_min → true
+    const expiresAt = Date.now() + 30 * 60 * 1000;
     expect(isTokenExpired(expiresAt)).toBe(true);
   });
 });
@@ -895,21 +895,23 @@ describe("validateTokenResponse (indirect via refreshAccessToken)", () => {
     expect(result.error).toBe("invalid_refresh_response");
   });
 
-  it("returns failed when refresh response has whitespace-only refresh_token", async () => {
+  it("returns success when refresh response has whitespace-only refresh_token (RFC 6749: reuse original)", async () => {
     const expiredToken = makeStoredToken({ expiry_date: Date.now() - 1000 });
     fs.writeFileSync(configState.tokenPath, JSON.stringify(expiredToken), "utf-8");
 
     (fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
       makeFetchResponse({
         access_token: "valid-access",
-        refresh_token: "\t\n ",  // whitespace only
+        refresh_token: "\t\n ",  // whitespace only — treated as missing per RFC 6749
         expires_in: 3600,
       })
     );
 
-    const result = await mod.refreshAccessToken("some-refresh") as { type: string; error?: string };
-    expect(result.type).toBe("failed");
-    expect(result.error).toBe("invalid_refresh_response");
+    const result = await mod.refreshAccessToken("some-refresh") as { type: string; refresh?: string };
+    // Per RFC 6749 Section 5.1: if refresh_token is omitted/empty, reuse the original.
+    // refreshAccessToken uses effectiveRefreshToken from disk (stored "refresh-token-value")
+    expect(result.type).toBe("success");
+    expect(result.refresh).toBe("refresh-token-value"); // effective refresh token from stored file
   });
 });
 

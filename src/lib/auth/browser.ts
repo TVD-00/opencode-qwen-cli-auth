@@ -28,13 +28,20 @@ export function getBrowserOpener(): string {
  */
 export function openBrowserUrl(url: string): void {
     try {
-        const opener = getBrowserOpener();
-        // Spawn browser process with detached stdio to avoid blocking
-        spawn(opener, [url], {
-            stdio: "ignore",
-            // Use shell on Windows for 'start' command to work properly
-            shell: process.platform === "win32",
-        });
+        if (process.platform === "win32") {
+            // On Windows, use cmd /c start with shell: false to avoid & being
+            // interpreted as a command separator by cmd.exe. The empty string ""
+            // is required as the window title argument for the start command.
+            spawn("cmd", ["/c", "start", "", url], {
+                stdio: "ignore",
+                shell: false,
+            });
+        } else {
+            const opener = getBrowserOpener();
+            spawn(opener, [url], {
+                stdio: "ignore",
+            });
+        }
     } catch (error) {
         // Log warning for debugging, user can still open URL manually
         console.warn("[qwen-oauth-plugin] Unable to open browser:", (error as Error)?.message || error);

@@ -175,10 +175,11 @@ export const VERIFICATION_URI = {
 
 /**
  * Token refresh buffer in milliseconds
- * Tokens are refreshed 30 seconds before expiry to avoid race conditions
+ * Tokens are refreshed 30 minutes before expiry to avoid race conditions
+ * and reduce unnecessary refresh attempts during active sessions
  * @constant {number}
  */
-export const TOKEN_REFRESH_BUFFER_MS: number = 30 * 1000; // 30 seconds
+export const TOKEN_REFRESH_BUFFER_MS: number = 30 * 60 * 1000; // 30 minutes
 
 /**
  * Stream processing configuration

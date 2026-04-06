@@ -152,7 +152,8 @@ export declare const VERIFICATION_URI: {
 };
 /**
  * Token refresh buffer in milliseconds
- * Tokens are refreshed 30 seconds before expiry to avoid race conditions
+ * Tokens are refreshed 30 minutes before expiry to avoid race conditions
+ * and reduce unnecessary refresh attempts during active sessions
  * @constant {number}
  */
 export declare const TOKEN_REFRESH_BUFFER_MS: number;

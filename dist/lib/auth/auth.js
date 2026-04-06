@@ -16,8 +16,10 @@ const MAX_REFRESH_RETRIES = 2;
 const REFRESH_RETRY_DELAY_MS = 2000;
 /** Timeout for OAuth HTTP requests in milliseconds */
 const OAUTH_REQUEST_TIMEOUT_MS = 15000;
-/** Lock timeout for multi-process token refresh coordination */
-const LOCK_TIMEOUT_MS = 10000;
+/** Lock timeout for multi-process token refresh coordination.
+ * Fix 2.3: Must be larger than OAUTH_REQUEST_TIMEOUT_MS (15s) + disk I/O headroom
+ * to prevent Process 2 from stealing Process 1's lock mid-refresh. */
+const LOCK_TIMEOUT_MS = 30000;
 /** Interval between lock acquisition attempts */
 const LOCK_ATTEMPT_INTERVAL_MS = 100;
 /** Backoff multiplier for lock retry interval */
@@ -120,18 +122,25 @@ function normalizeResourceUrl(resourceUrl) {
  * Validates OAuth token response has required fields
  * @param {Object} json - Token response JSON
  * @param {string} context - Context for error messages (e.g., "token response", "refresh response")
+ * @param {Object} [options] - Validation options
+ * @param {boolean} [options.requireRefreshToken=true] - Whether refresh_token is required.
+ *   Per OAuth 2.0 spec (RFC 6749 Section 5.1), a refresh response MAY omit refresh_token,
+ *   in which case the original refresh token remains valid. Set to false for refresh responses.
  * @returns {boolean} True if response is valid
  */
-function validateTokenResponse(json, context) {
+function validateTokenResponse(json, context, options = {}) {
+    const requireRefreshToken = options.requireRefreshToken !== false;
     // Check access_token exists and is string
     if (!json.access_token || typeof json.access_token !== "string" || json.access_token.trim().length === 0) {
         logError(`${context} missing access_token`);
         return false;
     }
-    // Check refresh_token exists and is string
-    if (!json.refresh_token || typeof json.refresh_token !== "string" || json.refresh_token.trim().length === 0) {
-        logError(`${context} missing refresh_token`);
-        return false;
+    // Check refresh_token exists and is string (only when required)
+    if (requireRefreshToken) {
+        if (!json.refresh_token || typeof json.refresh_token !== "string" || json.refresh_token.trim().length === 0) {
+            logError(`${context} missing refresh_token`);
+            return false;
+        }
     }
     // Check expires_in is valid positive number
     if (typeof json.expires_in !== "number" || json.expires_in <= 0) {
@@ -875,8 +884,8 @@ async function refreshAccessTokenOnce(refreshToken) {
                 all_fields: Object.keys(json),
             });
         }
-        // Validate refresh response structure
-        if (!validateTokenResponse(json, "refresh response")) {
+        // Validate refresh response structure (refresh_token is optional per RFC 6749 Section 5.1)
+        if (!validateTokenResponse(json, "refresh response", { requireRefreshToken: false })) {
             return {
                 type: "failed",
                 error: "invalid_refresh_response",
@@ -888,10 +897,14 @@ async function refreshAccessTokenOnce(refreshToken) {
         if (!json.resource_url) {
             logWarn("No valid resource_url in refresh response, will use default DashScope endpoint");
         }
+        // Per OAuth 2.0 spec: if server omits refresh_token, reuse the original one
+        const effectiveRefreshToken = typeof json.refresh_token === "string" && json.refresh_token.trim().length > 0
+            ? json.refresh_token
+            : refreshToken;
         return {
             type: "success",
             access: json.access_token,
-            refresh: json.refresh_token,
+            refresh: effectiveRefreshToken,
             expires: Date.now() + json.expires_in * 1000,
             resourceUrl: json.resource_url,
         };
@@ -1174,100 +1187,99 @@ export async function getActiveOAuthAccount(options = {}) {
                     logWarn("Failed to persist account store changes", writeError);
                 }
             }
+            // Fix 1.5: Keep lock held during sync + validate to prevent
+            // cross-account contamination when two processes run in parallel.
+            if (!selected) {
+                return null;
+            }
+            if (options.requireHealthy && selected.account.exhaustedUntil > Date.now()) {
+                return null;
+            }
+            try {
+                syncAccountToLegacyTokenFile(selected.account);
+            }
+            catch (error) {
+                logWarn("Failed to sync active account token to oauth_creds.json", error);
+                // Non-fatal: continue with account data from memory
+            }
+            const valid = await getValidTokenDetailed({ clearOnFailure: false });
+            if (valid.type === "success") {
+                const latest = loadStoredToken();
+                // Fix 1.4: Compare access_token (just validated) instead of refresh_token.
+                // After token rotation, the refresh_token in `latest` is NEW while
+                // selected.account still has the OLD one — so they never match.
+                if (latest && latest.access_token === valid.accessToken) {
+                    try {
+                        const target = store.accounts.find((account) => account.id === selected.account.id);
+                        if (target) {
+                            target.token = latest;
+                            target.resource_url = latest.resource_url;
+                            target.updatedAt = Date.now();
+                            writeAccountsStoreData(store);
+                        }
+                    }
+                    catch (error) {
+                        logWarn("Failed to update account token from refreshed legacy token", error);
+                    }
+                }
+                else if (latest) {
+                    if (LOGGING_ENABLED) {
+                        logWarn("Legacy token file was overwritten by another process, skipping write-back", {
+                            accountId: selected.account.id,
+                            expectedAccess: valid.accessToken?.slice(0, 8),
+                            actualAccess: latest.access_token?.slice(0, 8),
+                        });
+                    }
+                }
+                return buildRuntimeAccountResponse(selected.account, selected.healthyCount, selected.totalCount, valid.accessToken, valid.resourceUrl);
+            }
+            // Token validation failed — handle auth_rejected inside lock scope
+            if (valid.type !== "auth_rejected") {
+                return null;
+            }
+            attemptedAuthRejected.add(selected.account.id);
+            if (attemptedAuthRejected.size >= selected.totalCount) {
+                if (LOGGING_ENABLED) {
+                    logWarn("All OAuth accounts rejected with auth_invalid, re-authentication required", {
+                        attempted: attemptedAuthRejected.size,
+                        total: selected.totalCount,
+                    });
+                }
+                return null;
+            }
+            // Mark the rejected account and switch to next healthy one
+            const rejectedTarget = store.accounts.find((account) => account.id === selected.account.id);
+            if (rejectedTarget) {
+                const now = Date.now();
+                rejectedTarget.exhaustedUntil = now + getQuotaCooldownMs();
+                rejectedTarget.lastErrorCode = "auth_invalid";
+                rejectedTarget.updatedAt = now;
+            }
+            const nextHealthy = pickNextHealthyAccount(store, attemptedAuthRejected, Date.now());
+            if (nextHealthy) {
+                store.activeAccountId = nextHealthy.id;
+                try {
+                    writeAccountsStoreData(store);
+                }
+                catch (writeErr) {
+                    logWarn("Failed to persist account switch after auth_invalid", writeErr);
+                }
+            }
+            else {
+                if (LOGGING_ENABLED) {
+                    logWarn("No healthy OAuth account available after auth_invalid", {
+                        accountID: selected.account.id,
+                        attempted: attemptedAuthRejected.size,
+                        total: selected.totalCount,
+                    });
+                }
+                return null;
+            }
         }
         finally {
             releaseAccountsLock(lockHandle);
         }
-        if (!selected) {
-            return null;
-        }
-        if (options.requireHealthy && selected.account.exhaustedUntil > Date.now()) {
-            return null;
-        }
-        try {
-            syncAccountToLegacyTokenFile(selected.account);
-        }
-        catch (error) {
-            logWarn("Failed to sync active account token to oauth_creds.json", error);
-            // Non-fatal: continue with account data from memory
-        }
-        const valid = await getValidTokenDetailed({ clearOnFailure: false });
-        if (valid.type === "success") {
-            const latest = loadStoredToken();
-            if (latest && latest.refresh_token === selected.account.token.refresh_token) {
-                try {
-                    await withAccountsStoreLock((store) => {
-                        const target = store.accounts.find((account) => account.id === selected.account.id);
-                        if (!target) {
-                            return store;
-                        }
-                        target.token = latest;
-                        target.resource_url = latest.resource_url;
-                        target.updatedAt = Date.now();
-                        return store;
-                    });
-                }
-                catch (error) {
-                    logWarn("Failed to update account token from refreshed legacy token", error);
-                }
-            }
-            else if (latest) {
-                if (LOGGING_ENABLED) {
-                    logWarn("Legacy token file was overwritten by another process, skipping write-back", {
-                        accountId: selected.account.id,
-                        expectedRefresh: selected.account.token.refresh_token?.slice(0, 8),
-                        actualRefresh: latest.refresh_token?.slice(0, 8),
-                    });
-                }
-            }
-            return buildRuntimeAccountResponse(selected.account, selected.healthyCount, selected.totalCount, valid.accessToken, valid.resourceUrl);
-        }
-        if (valid.type !== "auth_rejected") {
-            return null;
-        }
-        attemptedAuthRejected.add(selected.account.id);
-        if (attemptedAuthRejected.size >= selected.totalCount) {
-            if (LOGGING_ENABLED) {
-                logWarn("All OAuth accounts rejected with auth_invalid, re-authentication required", {
-                    attempted: attemptedAuthRejected.size,
-                    total: selected.totalCount,
-                });
-            }
-            return null;
-        }
-        let switchedToHealthy = false;
-        try {
-            await withAccountsStoreLock((store) => {
-                const now = Date.now();
-                const target = store.accounts.find((account) => account.id === selected.account.id);
-                if (!target) {
-                    return store;
-                }
-                target.exhaustedUntil = now + getQuotaCooldownMs();
-                target.lastErrorCode = "auth_invalid";
-                target.updatedAt = now;
-                const next = pickNextHealthyAccount(store, attemptedAuthRejected, now);
-                if (next) {
-                    store.activeAccountId = next.id;
-                    switchedToHealthy = true;
-                }
-                return store;
-            });
-        }
-        catch (error) {
-            logWarn("Failed to switch OAuth account after auth_invalid", error);
-            return null;
-        }
-        if (!switchedToHealthy) {
-            if (LOGGING_ENABLED) {
-                logWarn("No healthy OAuth account available after auth_invalid", {
-                    accountID: selected.account.id,
-                    attempted: attemptedAuthRejected.size,
-                    total: selected.totalCount,
-                });
-            }
-            return null;
-        }
+        // Loop continues to retry with the next healthy account
     }
 }
 export async function markOAuthAccountQuotaExhausted(accountId, errorCode = "insufficient_quota") {
@@ -1361,7 +1373,8 @@ async function getValidTokenDetailed(options = {}) {
     const status = typeof refreshResult.status === "number"
         ? refreshResult.status
         : undefined;
-    const isAuthRejected = status === 401 ||
+    const isAuthRejected = status === 400 ||
+        status === 401 ||
         status === 403 ||
         refreshResult.error === "refresh_token_rejected";
     if (clearOnFailure) {

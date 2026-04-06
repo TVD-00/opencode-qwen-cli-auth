@@ -44,6 +44,11 @@ const PLUGIN_USER_AGENT = `QwenCode/${QWEN_CLI_VERSION} (${process.platform}; ${
 const MAX_CONSECUTIVE_POLL_FAILURES = 3;
 const CHAT_MAX_TOKENS_CAP = 65536;
 
+/** In-memory token cache to reduce Disk I/O per request (Issue 3.0) */
+const TOKEN_CACHE_TTL_MS = 10_000; // 10 seconds
+let cachedAccountResponse: Awaited<ReturnType<typeof getActiveOAuthAccount>> | null = null;
+let cachedAccountResponseExpiry = 0;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -105,6 +110,9 @@ async function getValidAccessToken(
         resourceUrl = (r as TokenSuccess).resourceUrl;
         saveToken(r);
         await upsertOAuthAccount(r, { setActive: false });
+        // Fix 1.1: Return early to prevent bootstrap block from overwriting
+        // the freshly refreshed token with stale SDK auth state
+        return { accessToken, resourceUrl };
       } else {
         accessToken = undefined;
       }
@@ -253,7 +261,6 @@ export const QwenAuthPlugin: Plugin = async () => ({
       const token = await getValidAccessToken(getAuth);
       if (!token?.accessToken) return {};
 
-      const capturedAccountId = token.accountId || null;
       const baseURL = getBaseUrl(token.resourceUrl);
       if (LOGGING_ENABLED) logInfo("loader baseURL:", baseURL);
 
@@ -290,10 +297,19 @@ export const QwenAuthPlugin: Plugin = async () => ({
           const headers = new Headers(opts.headers as HeadersInit | undefined);
           applyDashScopeHeaders(headers);
 
-          // Always get fresh token (like Copilot plugin — calls getAuth() each request)
-          const fresh = await getActiveOAuthAccount({
-            allowExhausted: false,
-          });
+          // Fix 3.0: Use in-memory cache to avoid disk I/O on every request
+          let fresh: Awaited<ReturnType<typeof getActiveOAuthAccount>>;
+          if (cachedAccountResponse && Date.now() < cachedAccountResponseExpiry) {
+            fresh = cachedAccountResponse;
+          } else {
+            fresh = await getActiveOAuthAccount({
+              allowExhausted: false,
+            });
+            cachedAccountResponse = fresh;
+            cachedAccountResponseExpiry = Date.now() + TOKEN_CACHE_TTL_MS;
+          }
+          // Fix 1.2: Track the current account ID dynamically for 429 handling
+          const currentAccountId = fresh?.accountId || null;
           if (fresh?.accessToken) {
             headers.set("Authorization", `Bearer ${fresh.accessToken}`);
           }
@@ -304,38 +320,73 @@ export const QwenAuthPlugin: Plugin = async () => ({
 
           // -- 401: token expired mid-session --
           if (response.status === 401) {
-            await response.text().catch(() => ""); // consume body
+            const body = await response.text().catch(() => ""); // consume body
             if (LOGGING_ENABLED) logWarn("401 — refreshing token");
             try {
+              // Fix 2.2: Mark current account as auth_invalid BEFORE fetching
+              // a new one. Otherwise getActiveOAuthAccount may return the same
+              // token because isTokenExpired() checks local time, not server state.
+              if (currentAccountId) {
+                await markOAuthAccountQuotaExhausted(currentAccountId, "auth_invalid");
+              }
+              // Invalidate cache so we get a genuinely different account
+              cachedAccountResponse = null;
+              cachedAccountResponseExpiry = 0;
+
               const refreshed = await getActiveOAuthAccount({
                 allowExhausted: false,
               });
               if (refreshed?.accessToken) {
+                // Update cache with the new account
+                cachedAccountResponse = refreshed;
+                cachedAccountResponseExpiry = Date.now() + TOKEN_CACHE_TTL_MS;
+
                 headers.set(
                   "Authorization",
                   `Bearer ${refreshed.accessToken}`,
                 );
                 opts.headers = headers;
                 response = await globalThis.fetch(input, opts);
+              } else {
+                // Fix 1.3: Reconstruct response with consumed body
+                response = new Response(body, {
+                  status: 401,
+                  statusText: response.statusText,
+                  headers: response.headers,
+                });
               }
             } catch {
-              // give up — return original 401
+              // Fix 1.3: Reconstruct original 401 since body was consumed
+              response = new Response(body, {
+                status: 401,
+                statusText: response.statusText,
+                headers: response.headers,
+              });
             }
           }
 
           // -- 429 insufficient_quota: switch account --
-          if (response.status === 429 && capturedAccountId) {
+          // Fix 1.2: Use currentAccountId (dynamic) instead of capturedAccountId (static)
+          if (response.status === 429 && currentAccountId) {
             const body = await response.text().catch(() => "");
             if (body.includes("insufficient_quota")) {
               try {
                 await markOAuthAccountQuotaExhausted(
-                  capturedAccountId,
+                  currentAccountId,
                   "insufficient_quota",
                 );
+                // Invalidate cache after marking account exhausted
+                cachedAccountResponse = null;
+                cachedAccountResponseExpiry = 0;
+
                 const next = await switchToNextHealthyOAuthAccount([
-                  capturedAccountId,
+                  currentAccountId,
                 ]);
                 if (next?.accessToken) {
+                  // Update cache with the new account
+                  cachedAccountResponse = next;
+                  cachedAccountResponseExpiry = Date.now() + TOKEN_CACHE_TTL_MS;
+
                   headers.set(
                     "Authorization",
                     `Bearer ${next.accessToken}`,
@@ -472,7 +523,7 @@ export const QwenAuthPlugin: Plugin = async () => ({
       models: {
         "coder-model": {
           id: "coder-model",
-          name: "Qwen 3.5 Plus",
+          name: "Qwen 3.6 Plus",
           attachment: false,
           reasoning: true,
           limit: { context: 1_048_576, output: CHAT_MAX_TOKENS_CAP },
