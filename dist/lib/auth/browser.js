@@ -34,19 +34,24 @@ export function getBrowserOpener() {
 export function openBrowserUrl(url) {
     try {
         if (process.platform === "win32") {
-            // On Windows, `cmd /c start "" "url"` is required:
-            //  - First "" is the window title (required by start command)
-            //  - Second quoted url prevents & from being parsed as cmd separator
-            spawn("cmd", ["/c", "start", "", `"${url}"`], {
+            // Build a single command string for cmd.exe so the URL stays quoted
+            // during shell parsing. Passing `"url"` as a separate spawn argument
+            // makes cmd treat the quotes literally on Windows, which breaks opening.
+            const command = `start "" "${url.replaceAll('"', "%22")}"`;
+            const child = spawn("cmd", ["/d", "/s", "/c", command], {
                 stdio: "ignore",
                 shell: false,
+                windowsHide: true,
+                windowsVerbatimArguments: true,
             });
+            child.unref();
         }
         else {
             const opener = getBrowserOpener();
-            spawn(opener, [url], {
+            const child = spawn(opener, [url], {
                 stdio: "ignore",
             });
+            child.unref();
         }
     }
     catch (error) {

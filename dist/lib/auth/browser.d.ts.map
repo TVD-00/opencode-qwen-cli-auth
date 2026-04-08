@@ -1,1 +1,1 @@
-{"version":3,"file":"browser.d.ts","sourceRoot":"","sources":["../../../src/lib/auth/browser.ts"],"names":[],"mappings":"AAAA;;;;GAIG;AAKH;;;GAGG;AACH,wBAAgB,gBAAgB,IAAI,MAAM,CAQzC;AAED;;;;;;;;;;GAUG;AACH,wBAAgB,cAAc,CAAC,GAAG,EAAE,MAAM,GAAG,IAAI,CAoBhD"}
+{"version":3,"file":"browser.d.ts","sourceRoot":"","sources":["../../../src/lib/auth/browser.ts"],"names":[],"mappings":"AAAA;;;;GAIG;AAKH;;;GAGG;AACH,wBAAgB,gBAAgB,IAAI,MAAM,CAQzC;AAED;;;;;;;;;;GAUG;AACH,wBAAgB,cAAc,CAAC,GAAG,EAAE,MAAM,GAAG,IAAI,CAyBhD"}
